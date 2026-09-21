@@ -493,6 +493,7 @@ Handles plain targets, bit selects and concatenations."
         (let ((name (sv-parse--last-ident tokens)))
           (list :type 'typedef
                 :name (and name (sv-token-text name))
+                :text (sv-parse-token-string tokens)
                 :enum-members (sv-parse--enum-members tokens)
                 :line line :beg beg :end sv-parse--pos))))
 
@@ -924,6 +925,178 @@ holding the design units together with the token stream they came from."
   (with-temp-buffer
     (insert-file-contents file)
     (sv-parse-tokens (sv-lex))))
+
+
+
+;;;; Declaration gathering
+
+(defvar sv-parse--declarations nil
+  "Accumulator used while walking a node for the names it declares.")
+
+(defun sv-parse--record-declaration (name kind line token &optional extra)
+  "Push a declaration record built from NAME, KIND, LINE, TOKEN and EXTRA."
+  (when (and name (stringp name))
+    (push (append (list :name name :kind kind :line line :token token) extra)
+          sv-parse--declarations)))
+
+(defun sv-parse-header-names (tokens)
+  "Return identifiers declared by a loop header TOKENS such as `for (int i...)'."
+  (let ((names '()) (previous nil) (bracket-depth 0) (foreach nil))
+    (dolist (tok tokens)
+      (let ((text (sv-token-text tok)))
+        (cond
+         ((equal text "[") (setq bracket-depth (1+ bracket-depth) foreach t))
+         ((equal text "]") (setq bracket-depth (max 0 (1- bracket-depth))))
+         ((and (eq (sv-token-type tok) 'ident)
+               (or (and previous
+                        (or (member (sv-token-text previous) sv-lexer-data-types)
+                            (member (sv-token-text previous) '("genvar" "var"))))
+                   (and foreach (> bracket-depth 0))))
+          (push (cons (sv-token-text tok) tok) names)))
+        (setq previous tok)))
+    (nreverse names)))
+
+(defun sv-parse--scan-declarations (node)
+  "Collect every name NODE declares, recursively."
+  (when (and node (listp node) (plist-member node :type))
+    (let ((type (plist-get node :type)))
+      (cl-case type
+        (decl
+         (dolist (name (plist-get node :names))
+           (sv-parse--record-declaration (plist-get name :name)
+                                 (if (plist-get node :nettype) 'net 'var)
+                                 (plist-get name :line) (plist-get name :token)
+                                 (list :node node :decl name))))
+        (param
+         (dolist (param (plist-get node :params))
+           (sv-parse--record-declaration (plist-get param :name) 'param
+                                         (plist-get param :line)
+                                         (plist-get param :token)
+                                         (list :node node :decl param))))
+        (genvar
+         (dolist (name (plist-get node :names))
+           (sv-parse--record-declaration (plist-get name :name) 'genvar
+                                 (plist-get name :line) (plist-get name :token))))
+        (typedef
+         (sv-parse--record-declaration (plist-get node :name) 'typedef
+                                       (plist-get node :line) nil
+                                       (list :node node))
+         (dolist (member (plist-get node :enum-members))
+           (sv-parse--record-declaration (plist-get member :name) 'enum
+                                 (plist-get member :line) nil)))
+        ((task function)
+         (sv-parse--record-declaration (plist-get node :name) type
+                                       (plist-get node :line) nil
+                                       (list :node node))
+         (dolist (arg (plist-get node :args))
+           (sv-parse--record-declaration (plist-get arg :name) 'arg
+                                 (plist-get arg :line) (plist-get arg :token)))
+         (mapc #'sv-parse--scan-declarations (plist-get node :body)))
+        (instance
+         (dolist (sibling (plist-get node :siblings))
+           (sv-parse--record-declaration (plist-get sibling :name) 'instance
+                                         (plist-get sibling :line) nil
+                                         (list :node node
+                                               :module (plist-get node :module)))))
+        ((generate generate-block)
+         (sv-parse--record-declaration (plist-get node :label) 'label
+                               (plist-get node :line) nil)
+         (mapc #'sv-parse--scan-declarations (plist-get node :items)))
+        (generate-for
+         (dolist (pair (sv-parse-header-names (plist-get node :header)))
+           (sv-parse--record-declaration (car pair) 'genvar
+                                 (sv-token-line (cdr pair)) (cdr pair)))
+         (sv-parse--scan-declarations (plist-get node :body)))
+        (generate-if
+         (sv-parse--scan-declarations (plist-get node :then))
+         (sv-parse--scan-declarations (plist-get node :else)))
+        (generate-case
+         (mapc #'sv-parse--scan-declarations (plist-get node :items)))
+        (block
+         (sv-parse--record-declaration (plist-get node :label) 'label
+                               (plist-get node :line) nil)
+         (mapc #'sv-parse--scan-declarations (plist-get node :stmts)))
+        (fork (mapc #'sv-parse--scan-declarations (plist-get node :stmts)))
+        ((always initial final)
+         (sv-parse--scan-declarations (plist-get node :body)))
+        (if
+         (sv-parse--scan-declarations (plist-get node :then))
+         (sv-parse--scan-declarations (plist-get node :else)))
+        (case
+         (dolist (item (plist-get node :items))
+           (sv-parse--scan-declarations (plist-get item :stmt))))
+        (loop
+         (dolist (pair (sv-parse-header-names (plist-get node :header)))
+           (sv-parse--record-declaration (car pair) 'loopvar
+                                 (sv-token-line (cdr pair)) (cdr pair)))
+         (sv-parse--scan-declarations (plist-get node :body)))
+        (t nil)))))
+
+(defun sv-parse--unit-declarations (unit)
+  "Return every declaration made by UNIT, ports and parameters included."
+  (let ((sv-parse--declarations '()))
+    (dolist (param (plist-get unit :params))
+      (sv-parse--record-declaration (plist-get param :name) 'param
+                                    (plist-get param :line)
+                                    (plist-get param :token)
+                                    (list :decl param)))
+    (dolist (port (plist-get unit :ports))
+      (sv-parse--record-declaration (plist-get port :name) 'port
+                            (plist-get port :line) (plist-get port :token)
+                            (list :dir (plist-get port :dir) :port port)))
+    (mapc #'sv-parse--scan-declarations (plist-get unit :items))
+    (nreverse sv-parse--declarations)))
+
+
+(defun sv-parse-statements (node)
+  "Return NODE and every statement nested inside it, depth first."
+  (let ((found '()))
+    (cl-labels
+        ((walk (stmt)
+           (when (and stmt (listp stmt) (plist-member stmt :type))
+             (push stmt found)
+             (cl-case (plist-get stmt :type)
+               (block (mapc #'walk (plist-get stmt :stmts)))
+               (fork (mapc #'walk (plist-get stmt :stmts)))
+               (if (walk (plist-get stmt :then)) (walk (plist-get stmt :else)))
+               (case (dolist (item (plist-get stmt :items))
+                       (walk (plist-get item :stmt))))
+               (loop (walk (plist-get stmt :body)))
+               ((always initial final) (walk (plist-get stmt :body)))
+               ((module interface program package generate generate-block)
+                (mapc #'walk (plist-get stmt :items)))
+               (generate-for (walk (plist-get stmt :body)))
+               (generate-if (walk (plist-get stmt :then))
+                            (walk (plist-get stmt :else)))
+               (generate-case (mapc #'walk (plist-get stmt :items)))
+               ((task function) (mapc #'walk (plist-get stmt :body)))
+               (t nil)))))
+      (walk node))
+    (nreverse found)))
+
+(defun sv-parse-assigned-names (node)
+  "Return every signal NODE assigns to, on any path."
+  (let ((names '()))
+    (dolist (stmt (sv-parse-statements node))
+      (when (memq (plist-get stmt :type) '(assign continuous-assign))
+        (setq names (append (plist-get stmt :lhs-targets) names))))
+    (delete-dups names)))
+
+(defun sv-parse-declarations (node)
+  "Return every name NODE declares, as a list of plists.
+Each record carries at least `:name\=', `:kind\=', `:line\=' and `:token\='.
+For a design unit the list starts with its parameters and ports; for any
+other node it holds whatever that subtree declares."
+  (if (memq (plist-get node :type) '(module interface package program class))
+      (sv-parse--unit-declarations node)
+    (let ((sv-parse--declarations '()))
+      (sv-parse--scan-declarations node)
+      (nreverse sv-parse--declarations))))
+
+(defun sv-parse-declared-names (node)
+  "Return the names NODE declares, as a list of strings."
+  (mapcar (lambda (record) (plist-get record :name))
+          (sv-parse-declarations node)))
 
 
 ;;;; Tree walking

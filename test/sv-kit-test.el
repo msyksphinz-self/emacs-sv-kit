@@ -17,6 +17,8 @@
 (require 'sv-format)
 (require 'sv-kit)
 (require 'sv-mode)
+(require 'sv-index)
+(require 'sv-ide)
 
 (defun sv-test-types (text)
   "Return the type of every significant token of TEXT."
@@ -756,6 +758,229 @@ OCCURRENCE selects which match to look at, counting from one."
 (ert-deftest sv-mode-claims-verilog-file-names ()
   (dolist (name '("foo.sv" "foo.svh" "foo.v" "foo.vh"))
     (should (eq (assoc-default name auto-mode-alist #'string-match-p) #'sv-mode))))
+
+
+;;;; Project index and editor services
+
+(defconst sv-test-fixtures
+  (expand-file-name "fixtures"
+                    (file-name-directory
+                     (or load-file-name buffer-file-name default-directory)))
+  "Directory holding the small project the index tests run against.")
+
+(defmacro sv-test-with-project (&rest body)
+  "Run BODY with the fixture directory as the current project."
+  (declare (indent 0) (debug t))
+  `(let ((sv-index-root-markers '("filelist.f"))
+         (default-directory (file-name-as-directory sv-test-fixtures)))
+     (sv-index-invalidate)
+     (unwind-protect (progn ,@body) (sv-index-invalidate))))
+
+(defmacro sv-test-with-source (text &rest body)
+  "Run BODY in a `sv-mode' buffer of the fixture project holding TEXT."
+  (declare (indent 1) (debug t))
+  `(sv-test-with-project
+     (let ((buffer (generate-new-buffer " *sv-source*")))
+       (unwind-protect
+           (with-current-buffer buffer
+             (setq default-directory (file-name-as-directory sv-test-fixtures))
+             (insert ,text)
+             (sv-mode)
+             (goto-char (point-min))
+             ,@body)
+         (kill-buffer buffer)))))
+
+(ert-deftest sv-index-indexes-a-project ()
+  (sv-test-with-project
+    (let ((index (sv-index-project)))
+      (should (gethash "sub_block" (plist-get index :units)))
+      (should (gethash "types_pkg" (plist-get index :units)))
+      (should (equal (sv-symbol-signature (car (sv-index-lookup "i_data")))
+                     "input logic [W-1:0] i_data"))
+      (should (equal (sv-symbol-kind (car (sv-index-lookup "ST_RUN"))) 'enum))
+      (should (member "state_t" (sv-index-names))))))
+
+(ert-deftest sv-index-reuses-a-cached-file ()
+  (sv-test-with-project
+    (let* ((file (expand-file-name "sub_block.sv" sv-test-fixtures))
+           (first (car (sv-index-file file)))
+           (second (car (sv-index-file file))))
+      (should (eq first second))
+      (sv-index-invalidate file)
+      (should-not (eq first (car (sv-index-file file)))))))
+
+(ert-deftest sv-index-picks-the-closest-root ()
+  (sv-test-with-project
+    ;; The repository above the fixtures also carries a marker; the nearer
+    ;; one must win.
+    (let ((sv-index-root-markers '(".git" "filelist.f")))
+      (should (equal (file-name-as-directory (sv-index-root))
+                     (file-name-as-directory sv-test-fixtures))))))
+
+(ert-deftest sv-ide-finds-the-instance-around-point ()
+  (sv-test-with-source
+      "module probe;\n  sub_block #(.W (4)) u_sub (.i_clk (clk), .i_data (d));\nendmodule\n"
+    (search-forward ".i_data")
+    (let ((context (sv-ide-instance-context)))
+      (should (equal (plist-get context :module) "sub_block"))
+      (should (equal (plist-get context :instance) "u_sub"))
+      (should (equal (sort (copy-sequence (plist-get context :connected)) #'string<)
+                     '("i_clk" "i_data"))))))
+
+(ert-deftest sv-ide-completes-the-ports-still-free ()
+  (sv-test-with-source
+      "module probe;\n  sub_block u_sub (.i_clk (clk), ."
+    (goto-char (point-max))
+    (let ((completion (sv-ide-completion-at-point)))
+      (should (equal (nth 2 completion) '("i_data" "o_data")))
+      (should (string-match-p "input"
+                              (funcall (plist-get (nthcdr 3 completion)
+                                                  :annotation-function)
+                                       "i_data"))))))
+
+(ert-deftest sv-ide-completes-names-in-scope-before-the-project ()
+  (sv-test-with-source
+      "module probe;\n  logic w_local;\n  assign w_l"
+    (goto-char (point-max))
+    (let ((candidates (nth 2 (sv-ide-completion-at-point))))
+      (should (member "w_local" candidates))
+      (should (member "sub_block" candidates))
+      (should (< (cl-position "w_local" candidates :test #'equal)
+                 (cl-position "sub_block" candidates :test #'equal))))))
+
+(ert-deftest sv-ide-completes-system-tasks ()
+  (sv-test-with-source
+      "module probe;\n  initial $disp"
+    (goto-char (point-max))
+    (should (member "$display" (nth 2 (sv-ide-completion-at-point))))))
+
+(ert-deftest sv-ide-jumps-to-a-module-definition ()
+  (sv-test-with-source
+      "module probe;\n  sub_block u_sub (.i_clk (clk));\nendmodule\n"
+    (search-forward "sub_block")
+    (backward-char 2)
+    (let ((definitions (xref-backend-definitions
+                        'sv-kit (xref-backend-identifier-at-point 'sv-kit))))
+      (should definitions)
+      (should (string-match-p "module sub_block"
+                              (xref-item-summary (car definitions))))
+      (should (equal (file-name-nondirectory
+                      (xref-location-group (xref-item-location (car definitions))))
+                     "sub_block.sv")))))
+
+(ert-deftest sv-ide-jumps-to-a-local-declaration ()
+  (sv-test-with-source
+      "module probe;\n  logic [3:0] w_sum;\n  assign w_sum = 4'h0;\nendmodule\n"
+    (search-forward "assign w_sum")
+    (backward-char 2)
+    (let ((definitions (xref-backend-definitions 'sv-kit "w_sum")))
+      (should definitions)
+      (should (string-match-p "logic \\[3:0\\] w_sum"
+                              (xref-item-summary (car definitions)))))))
+
+(ert-deftest sv-ide-lists-references ()
+  (sv-test-with-project
+    (let ((references (xref-backend-references 'sv-kit "i_data")))
+      (should (> (length references) 1))
+      (should (cl-every (lambda (item) (stringp (xref-item-summary item)))
+                        references)))))
+
+(ert-deftest sv-ide-describes-the-name-at-point ()
+  (sv-test-with-source
+      "module probe;\n  logic [7:0] w_data;\n  sub_block u_sub (.i_data (w_data));\nendmodule\n"
+    (search-forward "w_data")
+    (backward-char 2)
+    (should (string-match-p "logic \\[7:0\\] w_data"
+                            (sv-ide-documentation-at-point)))
+    (goto-char (point-min))
+    (search-forward ".i_data")
+    (backward-char 2)
+    (should (equal (sv-ide-documentation-at-point)
+                   "sub_block.i_data: input logic [W-1:0]"))))
+
+(ert-deftest sv-kit-adds-the-ports-an-instance-leaves-out ()
+  (sv-test-with-source
+      "module probe;\n  logic clk;\n  sub_block u_sub (.i_clk (clk));\nendmodule\n"
+    (search-forward "u_sub")
+    (sv-kit-update-instance)
+    (should (string-match-p "\\.i_data +(i_data)" (buffer-string)))
+    (should (string-match-p "\\.o_data +(o_data)" (buffer-string)))
+    ;; Running it again changes nothing.
+    (let ((before (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "u_sub")
+      (sv-kit-update-instance)
+      (should (equal before (buffer-string))))))
+
+(ert-deftest sv-kit-declares-the-signals-a-module-assigns ()
+  (sv-test-with-source
+      "module probe;\n  logic [7:0] w_data;\n  always_comb w_sum = w_data;\n  assign w_flag = 1'b0;\nendmodule\n"
+    (search-forward "always_comb")
+    (sv-kit-declare-missing-signals)
+    (should (string-match-p "logic +w_flag;" (buffer-string)))
+    (should (string-match-p "logic +w_sum;" (buffer-string)))
+    ;; The new declarations sit with the others, above the logic.
+    (should (< (string-match "w_sum;" (buffer-string))
+               (string-match "always_comb" (buffer-string))))))
+
+
+;;;; Rules added on top of the first set
+
+(ert-deftest sv-lint-finds-a-signal-with-several-drivers ()
+  (let ((rules (sv-test-rules "module test (input logic i_a, output logic o_q);
+                                 logic w_x;
+                                 assign w_x = i_a;
+                                 always_comb w_x = ~i_a;
+                                 assign o_q = w_x;
+                               endmodule")))
+    (should (memq 'multiple-drivers rules))))
+
+(ert-deftest sv-lint-accepts-a-signal-driven-in-slices ()
+  (should-not
+   (memq 'multiple-drivers
+         (sv-test-rules "module test (input logic i_a, output logic [3:0] o_q);
+                           assign o_q[1:0] = {2{i_a}};
+                           assign o_q[3:2] = 2'b00;
+                         endmodule"))))
+
+(ert-deftest sv-lint-flags-an-assignment-to-an-input ()
+  (should (memq 'assignment-to-input
+                (sv-test-rules "module test (input logic i_a, output logic o_q);
+                                  always_comb i_a = 1'b0;
+                                  assign o_q = i_a;
+                                endmodule"))))
+
+(ert-deftest sv-lint-finds-a-repeated-case-label ()
+  (should (memq 'duplicate-case-label
+                (sv-test-rules "module test (input logic [1:0] i_s, output logic o_q);
+                                  always_comb begin
+                                    case (i_s)
+                                      2'b00 : o_q = 1'b0;
+                                      2'b00 : o_q = 1'b1;
+                                      default : o_q = 1'b0;
+                                    endcase
+                                  end
+                                endmodule"))))
+
+(ert-deftest sv-lint-flags-a-block-that-mixes-assignment-styles ()
+  (should (memq 'mixed-assignment-style
+                (sv-test-rules "module test (input logic i_clk, output logic o_q);
+                                  logic w_t;
+                                  always @(posedge i_clk) begin
+                                    w_t = 1'b1;
+                                    o_q <= w_t;
+                                  end
+                                endmodule"))))
+
+(ert-deftest sv-mode-outlines-design-units ()
+  (with-temp-buffer
+    (insert "module m;\n  always_comb x = 1;\nendmodule\n")
+    (sv-mode)
+    (goto-char (point-min))
+    (should (looking-at-p outline-regexp))
+    (forward-line 1)
+    (should (looking-at-p outline-regexp))
+    (should (= (funcall outline-level) 2))))
 
 (provide 'sv-kit-test)
 

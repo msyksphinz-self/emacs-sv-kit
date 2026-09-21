@@ -54,6 +54,10 @@
     (unused-parameter           warning "Declared parameter is never used.")
     (undriven-output            warning "Output port is never driven.")
     (duplicate-declaration      error   "Name declared more than once.")
+    (multiple-drivers           error   "Signal is driven from more than one place.")
+    (assignment-to-input        error   "Input port is assigned to.")
+    (duplicate-case-label       warning "Case label appears twice in one statement.")
+    (mixed-assignment-style     warning "Block mixes blocking and non-blocking assignments.")
     (positional-port-connection warning "Instance connects ports by position.")
     (unconnected-port           info    "Instance port is left unconnected.")
     (instance-unknown-port      error   "Instance connects a port the module does not have.")
@@ -226,117 +230,7 @@ An empty list means every rule, which is spelled t."
     (setf (sv-lint-context-suppress-ranges ctx) ranges)))
 
 
-;;;; Declaration and reference gathering
-
-(defvar sv-lint--decls nil
-  "Accumulator used while walking a unit for declarations.")
-
-(defun sv-lint--record-decl (name kind line token &optional extra)
-  "Push a declaration record built from NAME, KIND, LINE, TOKEN and EXTRA."
-  (when (and name (stringp name))
-    (push (append (list :name name :kind kind :line line :token token) extra)
-          sv-lint--decls)))
-
-(defun sv-lint--header-names (tokens)
-  "Return identifiers declared by a loop header TOKENS such as `for (int i...)'."
-  (let ((names '()) (previous nil) (bracket-depth 0) (foreach nil))
-    (dolist (tok tokens)
-      (let ((text (sv-token-text tok)))
-        (cond
-         ((equal text "[") (setq bracket-depth (1+ bracket-depth) foreach t))
-         ((equal text "]") (setq bracket-depth (max 0 (1- bracket-depth))))
-         ((and (eq (sv-token-type tok) 'ident)
-               (or (and previous
-                        (or (member (sv-token-text previous) sv-lexer-data-types)
-                            (member (sv-token-text previous) '("genvar" "var"))))
-                   (and foreach (> bracket-depth 0))))
-          (push (cons (sv-token-text tok) tok) names)))
-        (setq previous tok)))
-    (nreverse names)))
-
-(defun sv-lint--scan-decls (node)
-  "Collect every name NODE declares, recursively."
-  (when (and node (listp node) (plist-member node :type))
-    (let ((type (plist-get node :type)))
-      (cl-case type
-        (decl
-         (dolist (name (plist-get node :names))
-           (sv-lint--record-decl (plist-get name :name)
-                                 (if (plist-get node :nettype) 'net 'var)
-                                 (plist-get name :line) (plist-get name :token)
-                                 (list :node node :decl name))))
-        (param
-         (dolist (param (plist-get node :params))
-           (sv-lint--record-decl (plist-get param :name) 'param
-                                 (plist-get param :line) (plist-get param :token)
-                                 (list :node node))))
-        (genvar
-         (dolist (name (plist-get node :names))
-           (sv-lint--record-decl (plist-get name :name) 'genvar
-                                 (plist-get name :line) (plist-get name :token))))
-        (typedef
-         (sv-lint--record-decl (plist-get node :name) 'typedef
-                               (plist-get node :line) nil)
-         (dolist (member (plist-get node :enum-members))
-           (sv-lint--record-decl (plist-get member :name) 'enum
-                                 (plist-get member :line) nil)))
-        ((task function)
-         (sv-lint--record-decl (plist-get node :name) type
-                               (plist-get node :line) nil)
-         (dolist (arg (plist-get node :args))
-           (sv-lint--record-decl (plist-get arg :name) 'arg
-                                 (plist-get arg :line) (plist-get arg :token)))
-         (mapc #'sv-lint--scan-decls (plist-get node :body)))
-        (instance
-         (dolist (sibling (plist-get node :siblings))
-           (sv-lint--record-decl (plist-get sibling :name) 'instance
-                                 (plist-get sibling :line) nil)))
-        ((generate generate-block)
-         (sv-lint--record-decl (plist-get node :label) 'label
-                               (plist-get node :line) nil)
-         (mapc #'sv-lint--scan-decls (plist-get node :items)))
-        (generate-for
-         (dolist (pair (sv-lint--header-names (plist-get node :header)))
-           (sv-lint--record-decl (car pair) 'genvar
-                                 (sv-token-line (cdr pair)) (cdr pair)))
-         (sv-lint--scan-decls (plist-get node :body)))
-        (generate-if
-         (sv-lint--scan-decls (plist-get node :then))
-         (sv-lint--scan-decls (plist-get node :else)))
-        (generate-case
-         (mapc #'sv-lint--scan-decls (plist-get node :items)))
-        (block
-         (sv-lint--record-decl (plist-get node :label) 'label
-                               (plist-get node :line) nil)
-         (mapc #'sv-lint--scan-decls (plist-get node :stmts)))
-        (fork (mapc #'sv-lint--scan-decls (plist-get node :stmts)))
-        ((always initial final)
-         (sv-lint--scan-decls (plist-get node :body)))
-        (if
-         (sv-lint--scan-decls (plist-get node :then))
-         (sv-lint--scan-decls (plist-get node :else)))
-        (case
-         (dolist (item (plist-get node :items))
-           (sv-lint--scan-decls (plist-get item :stmt))))
-        (loop
-         (dolist (pair (sv-lint--header-names (plist-get node :header)))
-           (sv-lint--record-decl (car pair) 'loopvar
-                                 (sv-token-line (cdr pair)) (cdr pair)))
-         (sv-lint--scan-decls (plist-get node :body)))
-        (t nil)))))
-
-(defun sv-lint--unit-declarations (unit)
-  "Return every declaration made by UNIT, ports and parameters included."
-  (let ((sv-lint--decls '()))
-    (dolist (param (plist-get unit :params))
-      (sv-lint--record-decl (plist-get param :name) 'param
-                            (plist-get param :line) (plist-get param :token)))
-    (dolist (port (plist-get unit :ports))
-      (sv-lint--record-decl (plist-get port :name) 'port
-                            (plist-get port :line) (plist-get port :token)
-                            (list :dir (plist-get port :dir) :port port)))
-    (mapc #'sv-lint--scan-decls (plist-get unit :items))
-    (nreverse sv-lint--decls)))
+;;;; Reference gathering
 
 (defun sv-lint--ignored-tokens (unit declarations)
   "Return a hash of tokens that must not count as references inside UNIT.
@@ -382,46 +276,12 @@ IGNORED holds declaration tokens, plus the token index of instance types."
 
 ;;;; Statement analysis helpers
 
-(defun sv-lint--statements (node)
-  "Return NODE and every statement nested inside it, depth first."
-  (let ((found '()))
-    (cl-labels
-        ((walk (stmt)
-           (when (and stmt (listp stmt) (plist-member stmt :type))
-             (push stmt found)
-             (cl-case (plist-get stmt :type)
-               (block (mapc #'walk (plist-get stmt :stmts)))
-               (fork (mapc #'walk (plist-get stmt :stmts)))
-               (if (walk (plist-get stmt :then)) (walk (plist-get stmt :else)))
-               (case (dolist (item (plist-get stmt :items))
-                       (walk (plist-get item :stmt))))
-               (loop (walk (plist-get stmt :body)))
-               ((always initial final) (walk (plist-get stmt :body)))
-               ((module interface program package generate generate-block)
-                (mapc #'walk (plist-get stmt :items)))
-               (generate-for (walk (plist-get stmt :body)))
-               (generate-if (walk (plist-get stmt :then))
-                            (walk (plist-get stmt :else)))
-               (generate-case (mapc #'walk (plist-get stmt :items)))
-               ((task function) (mapc #'walk (plist-get stmt :body)))
-               (t nil)))))
-      (walk node))
-    (nreverse found)))
-
-(defun sv-lint--assigned-names (node)
-  "Return every signal NODE assigns to, on any path."
-  (let ((names '()))
-    (dolist (stmt (sv-lint--statements node))
-      (when (memq (plist-get stmt :type) '(assign continuous-assign))
-        (setq names (append (plist-get stmt :lhs-targets) names))))
-    (delete-dups names)))
-
 (defun sv-lint--write-tokens (node)
   "Return a hash of the tokens NODE uses as assignment targets.
 Writing to a signal is not using it, so these occurrences must not keep
 `unused-declaration' quiet."
   (let ((table (make-hash-table :test #'eq)))
-    (dolist (stmt (sv-lint--statements node))
+    (dolist (stmt (sv-parse-statements node))
       (when (memq (plist-get stmt :type) '(assign continuous-assign))
         (dolist (tok (sv-parse-lhs-tokens (plist-get stmt :lhs)))
           (puthash tok t table))))
@@ -456,7 +316,7 @@ Writing to a signal is not using it, so these occurrences must not keep
 (defun sv-lint--read-tokens (stmt)
   "Return the tokens STMT reads: right-hand sides, conditions and indices."
   (let ((tokens '()))
-    (dolist (inner (sv-lint--statements stmt))
+    (dolist (inner (sv-parse-statements stmt))
       (cl-case (plist-get inner :type)
         ((assign continuous-assign)
          (setq tokens (append (plist-get inner :rhs) tokens))
@@ -505,10 +365,8 @@ Writing to a signal is not using it, so these occurrences must not keep
     (when (eq (plist-get node :type) 'always)
       (let* ((kind (plist-get node :kind))
              (body (plist-get node :body))
-             (statements (sv-lint--statements body))
-             (local (let ((sv-lint--decls '()))
-                      (sv-lint--scan-decls body)
-                      (mapcar (lambda (decl) (plist-get decl :name)) sv-lint--decls))))
+             (statements (sv-parse-statements body))
+             (local (sv-parse-declared-names body)))
         (when (eq kind 'always_ff)
           (dolist (stmt statements)
             (when (and (eq (plist-get stmt :type) 'assign)
@@ -528,7 +386,7 @@ Writing to a signal is not using it, so these occurrences must not keep
                                (plist-get stmt :line) nil
                                (format "Non-blocking assignment to `%s' in combinational logic; use `='."
                                        (or (plist-get stmt :target) "signal")))))
-          (let* ((assigned (sv-lint--assigned-names body))
+          (let* ((assigned (sv-parse-assigned-names body))
                  (guaranteed (sv-lint--must-assign body))
                  (latched (cl-set-difference assigned guaranteed :test #'equal)))
             (dolist (name (sort latched #'string<))
@@ -546,7 +404,7 @@ Writing to a signal is not using it, so these occurrences must not keep
                    (not (plist-get node :star))
                    (plist-get node :sensitivity))
           (let* ((listed (sv-lint--token-names (plist-get node :sensitivity)))
-                 (assigned (sv-lint--assigned-names body))
+                 (assigned (sv-parse-assigned-names body))
                  (read (sv-lint--token-names (sv-lint--read-tokens body)))
                  (missing (cl-set-difference
                            (cl-set-difference read listed :test #'equal)
@@ -560,7 +418,7 @@ Writing to a signal is not using it, so these occurrences must not keep
 (defun sv-lint--rule-case (ctx unit)
   "Check that every case statement of UNIT has a default arm."
   (dolist (node (sv-parse-collect unit 'always))
-    (dolist (stmt (sv-lint--statements (plist-get node :body)))
+    (dolist (stmt (sv-parse-statements (plist-get node :body)))
       (when (eq (plist-get stmt :type) 'case)
         (let ((items (plist-get stmt :items))
               (qualifier (plist-get stmt :qualifier)))
@@ -573,7 +431,7 @@ Writing to a signal is not using it, so these occurrences must not keep
 
 (defun sv-lint--rule-names (ctx unit)
   "Check UNIT for undeclared, unused and duplicated names."
-  (let* ((declarations (sv-lint--unit-declarations unit))
+  (let* ((declarations (sv-parse-declarations unit))
          (ignored (sv-lint--ignored-tokens unit declarations))
          (references (sv-lint--references ctx unit ignored))
          (declared (make-hash-table :test #'equal))
@@ -628,7 +486,7 @@ Writing to a signal is not using it, so these occurrences must not keep
 
     ;; Outputs need a driver: a procedural or continuous assignment, or a
     ;; connection to an instance port.
-    (let ((driven (sv-lint--assigned-names unit)))
+    (let ((driven (sv-parse-assigned-names unit)))
       (dolist (instance (sv-parse-collect unit 'instance))
         (dolist (sibling (plist-get instance :siblings))
           (dolist (connection (plist-get sibling :connections))
@@ -755,6 +613,86 @@ Writing to a signal is not using it, so these occurrences must not keep
                        "File does not end with a newline."))))
 
 
+(defun sv-lint--driver-targets (node)
+  "Return what NODE drives, as a list of (NAME . PARTIAL) pairs.
+PARTIAL is non-nil when every assignment to NAME went through a bit or
+part select, which several blocks may legitimately share."
+  (let ((targets '()))
+    (dolist (stmt (sv-parse-statements node))
+      (when (memq (plist-get stmt :type) '(assign continuous-assign))
+        (let* ((lhs (plist-get stmt :lhs))
+               (tokens (sv-parse-lhs-tokens lhs)))
+          (dolist (tok tokens)
+            (let* ((name (sv-token-text tok))
+                   (rest (cdr (memq tok lhs)))
+                   (partial (and rest (equal (sv-token-text (car rest)) "[")))
+                   (entry (assoc name targets)))
+              (if entry
+                  (unless partial (setcdr entry nil))
+                (push (cons name partial) targets)))))))
+    (nreverse targets)))
+
+(defun sv-lint--rule-drivers (ctx unit)
+  "Check UNIT for signals driven from several places, and for driven inputs."
+  (let ((drivers (make-hash-table :test #'equal))
+        (inputs (make-hash-table :test #'equal)))
+    (dolist (port (plist-get unit :ports))
+      (when (eq (plist-get port :dir) 'input)
+        (puthash (plist-get port :name) port inputs)))
+    (dolist (item (plist-get unit :items))
+      ;; Only one branch of a generate is elaborated, and a generate loop
+      ;; drives a different slice each time around, so neither counts.
+      (when (memq (plist-get item :type) '(always continuous-assign))
+        (dolist (target (sv-lint--driver-targets item))
+          (let ((name (car target)))
+            (when (gethash name inputs)
+              (sv-lint--report ctx 'assignment-to-input (plist-get item :line) nil
+                               (format "Input port `%s' is assigned to." name)))
+            (unless (cdr target)
+              (puthash name (cons item (gethash name drivers)) drivers))))))
+    (maphash
+     (lambda (name items)
+       (when (> (length items) 1)
+         (let ((sorted (sort (mapcar (lambda (item) (plist-get item :line)) items) #'<)))
+           (sv-lint--report
+            ctx 'multiple-drivers (car (last sorted)) nil
+            (format "`%s' is driven from %d places (lines %s)."
+                    name (length sorted)
+                    (mapconcat #'number-to-string sorted ", "))))))
+     drivers)))
+
+(defun sv-lint--rule-case-labels (ctx unit)
+  "Check the case statements of UNIT for labels that appear twice."
+  (dolist (node (sv-parse-collect unit 'always))
+    (dolist (stmt (sv-parse-statements (plist-get node :body)))
+      (when (eq (plist-get stmt :type) 'case)
+        (let ((seen (make-hash-table :test #'equal)))
+          (dolist (item (plist-get stmt :items))
+            (dolist (label (sv-parse-split-commas (plist-get item :labels)))
+              (let ((text (sv-parse-token-text label)))
+                (if (gethash text seen)
+                    (sv-lint--report
+                     ctx 'duplicate-case-label (plist-get item :line) nil
+                     (format "Label `%s' already appears on line %d; the second arm is dead."
+                             text (gethash text seen)))
+                  (puthash text (plist-get item :line) seen))))))))))
+
+(defun sv-lint--rule-assignment-style (ctx unit)
+  "Warn when a plain `always' block of UNIT mixes assignment styles."
+  (dolist (node (sv-parse-collect unit 'always))
+    (when (eq (plist-get node :kind) 'always)
+      (let ((blocking nil) (nonblocking nil)
+            (local (sv-parse-declared-names (plist-get node :body))))
+        (dolist (stmt (sv-parse-statements (plist-get node :body)))
+          (when (and (eq (plist-get stmt :type) 'assign)
+                     (not (cl-every (lambda (name) (member name local))
+                                    (plist-get stmt :lhs-targets))))
+            (cond ((equal (plist-get stmt :op) "=") (setq blocking t))
+                  ((equal (plist-get stmt :op) "<=") (setq nonblocking t)))))
+        (when (and blocking nonblocking)
+          (sv-lint--report ctx 'mixed-assignment-style (plist-get node :line) nil
+                           "This block mixes blocking and non-blocking assignments."))))))
+
 ;;;; Entry points
 
 (defun sv-lint-module-table (tree &optional table)
@@ -806,6 +744,9 @@ MODULES is an optional table of known design units, as built by
         (sv-lint--rule-procedural ctx unit)
         (sv-lint--rule-case ctx unit)
         (sv-lint--rule-names ctx unit)
+        (sv-lint--rule-drivers ctx unit)
+        (sv-lint--rule-case-labels ctx unit)
+        (sv-lint--rule-assignment-style ctx unit)
         (sv-lint--rule-instances ctx unit)
         (sv-lint--rule-generate ctx unit)
         (sv-lint--rule-unit-style ctx unit)))

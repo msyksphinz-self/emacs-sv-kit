@@ -390,6 +390,16 @@ own parser, so no external Verilog package or tool is needed.
   (setq-local indent-region-function #'sv-format-indent-region)
   (setq-local electric-indent-chars
               (append '(?\; ?\) ?\}) electric-indent-chars))
+  (setq-local outline-regexp
+              (concat "[ \t]*\\_<"
+                      (regexp-opt '("module" "macromodule" "interface" "package"
+                                    "program" "class" "function" "task"
+                                    "generate" "always" "always_comb" "always_ff"
+                                    "always_latch" "initial" "final"))
+                      "\\_>"))
+  (setq-local outline-level
+              (lambda () (1+ (/ (current-indentation)
+                                (max 1 sv-format-indent-offset)))))
   (setq-local beginning-of-defun-function #'sv-mode-beginning-of-defun)
   (setq-local end-of-defun-function #'sv-mode-end-of-defun)
   (setq-local add-log-current-defun-function #'sv-mode-current-defun)

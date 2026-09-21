@@ -24,6 +24,8 @@
 ;;   C-c C-r   format the region          `sv-format-region'
 ;;   C-c C-l   list the lint findings     `sv-kit-lint'
 ;;   C-c C-i   insert an instantiation    `sv-kit-insert-instance'
+;;   C-c C-p   add the missing ports      `sv-kit-update-instance'
+;;   C-c C-d   declare missing signals    `sv-kit-declare-missing-signals'
 ;;   C-c C-u   jump to a design unit      `sv-kit-goto-unit'
 
 ;;; Code:
@@ -35,21 +37,13 @@
 (require 'sv-parser)
 (require 'sv-lint)
 (require 'sv-format)
+(require 'sv-index)
+(require 'sv-ide)
 
 (defgroup sv-kit nil
   "SystemVerilog tooling: parser, linter and formatter."
   :group 'languages
   :prefix "sv-kit-")
-
-(defcustom sv-kit-file-extensions '("sv" "svh" "v" "vh")
-  "File extensions searched when building the project module table."
-  :type '(repeat string)
-  :group 'sv-kit)
-
-(defcustom sv-kit-project-root-markers '(".git" "Makefile" "filelist.f")
-  "Files or directories that mark the root of a hardware project."
-  :type '(repeat string)
-  :group 'sv-kit)
 
 (defcustom sv-kit-format-on-save nil
   "When non-nil, `sv-kit-mode' formats the buffer before saving it."
@@ -61,49 +55,23 @@
   :type 'boolean
   :group 'sv-kit)
 
-(defvar-local sv-kit--module-table nil
-  "Cached table of the design units visible from this buffer.")
-
-(defvar-local sv-kit--module-table-time nil
-  "When `sv-kit--module-table' was last built.")
-
-(defcustom sv-kit-module-table-ttl 30
-  "Seconds a cached project module table stays fresh."
-  :type 'integer
-  :group 'sv-kit)
-
 
 ;;;; Project scanning
 
 (defun sv-kit-project-root (&optional directory)
   "Return the project root above DIRECTORY, or DIRECTORY itself."
-  (let ((directory (or directory default-directory)))
-    (or (cl-some (lambda (marker) (locate-dominating-file directory marker))
-                 sv-kit-project-root-markers)
-        directory)))
+  (sv-index-root directory))
 
 (defun sv-kit-project-files (&optional root)
   "Return every Verilog source under ROOT."
-  (let* ((root (or root (sv-kit-project-root)))
-         (regexp (concat "\\.\\(?:"
-                         (mapconcat #'regexp-quote sv-kit-file-extensions "\\|")
-                         "\\)\\'")))
-    (ignore-errors (directory-files-recursively root regexp))))
+  (sv-index-project-files root))
 
 (defun sv-kit-module-table (&optional force)
-  "Return the design units of the current project, caching the result.
-With FORCE non-nil, rebuild the table even when the cache is fresh."
-  (if (and (not force)
-           sv-kit--module-table
-           sv-kit--module-table-time
-           (< (float-time (time-subtract (current-time)
-                                         sv-kit--module-table-time))
-              sv-kit-module-table-ttl))
-      sv-kit--module-table
-    (setq sv-kit--module-table-time (current-time))
-    (setq sv-kit--module-table
-          (sv-lint-build-module-table (sv-kit-project-files)))))
-
+  "Return the design units of the current project.
+The index behind it caches each file against its modification time, so
+FORCE only asks for the list of files to be scanned again."
+  (when force (sv-index-invalidate))
+  (sv-index-lint-table))
 
 ;;;; Linting
 
@@ -318,6 +286,108 @@ filled in for you."
         (indent-region start (point))))))
 
 
+(defun sv-kit--instance-context ()
+  "Return the instantiation at point, whether point is in its ports or not."
+  (or (sv-ide-instance-context)
+      (save-excursion
+        (let ((limit (line-end-position 4))
+              (found nil))
+          (goto-char (line-beginning-position))
+          (while (and (not found) (search-forward "(" limit t))
+            (let ((context (sv-ide-instance-context (point))))
+              (when (and context (sv-index-unit (plist-get context :module)))
+                (setq found context))))
+          found))))
+
+;;;###autoload
+(defun sv-kit-update-instance ()
+  "Add the ports the instantiation at point leaves out.
+The module is looked up in the project, missing connections are appended
+as `.port (port)\=', and any connection naming a port the module does not
+have is reported."
+  (interactive)
+  (let* ((context (or (sv-kit--instance-context)
+                      (user-error "Point is not on a module instantiation")))
+         (module (plist-get context :module))
+         (unit (or (sv-index-unit module)
+                   (user-error "No module named `%s\=' in this project" module)))
+         (ports (plist-get unit :ports))
+         (connected (plist-get context :connected))
+         (missing (cl-remove-if (lambda (port)
+                                  (member (plist-get port :name) connected))
+                                ports))
+         (unknown (cl-remove-if (lambda (name)
+                                  (cl-find name ports
+                                           :key (lambda (port) (plist-get port :name))
+                                           :test #'equal))
+                                connected))
+         (open (plist-get context :open)))
+    (if (null missing)
+        (message "%s: every port of `%s' is connected%s"
+                 (plist-get context :instance) module
+                 (if unknown (format "; unknown: %s" (string-join unknown ", ")) ""))
+      (save-excursion
+        (goto-char open)
+        (forward-sexp)
+        (let ((close (1- (point))))
+          (goto-char close)
+          (skip-chars-backward " \t\n")
+          (let ((insert-at (point))
+                (first (eq (char-before) ?\()))
+            (goto-char insert-at)
+            (unless first (insert ","))
+            (insert (mapconcat (lambda (port)
+                                 (format "\n.%s (%s)"
+                                         (plist-get port :name)
+                                         (plist-get port :name)))
+                               missing ","))))
+        (goto-char open)
+        (let ((start (line-beginning-position)))
+          (forward-sexp)
+          (sv-format-region start (line-end-position))))
+      (message "%s: added %d port(s)%s"
+               (plist-get context :instance) (length missing)
+               (if unknown (format "; unknown: %s" (string-join unknown ", ")) "")))))
+
+;;;###autoload
+(defun sv-kit-declare-missing-signals ()
+  "Declare the signals this module assigns to but never declares.
+A `logic\=' declaration is inserted for each, just after the declarations
+already there, which is what you want after sketching some logic and
+before the linter complains."
+  (interactive)
+  (let* ((tree (car (sv-index-buffer)))
+         (unit (or (sv-ide--enclosing-unit)
+                   (car (plist-get tree :units))
+                   (user-error "No design unit in this buffer")))
+         (declared (sv-parse-declared-names unit))
+         (missing (cl-remove-if (lambda (name) (member name declared))
+                                (sv-parse-assigned-names unit))))
+    (if (null missing)
+        (message "Every assigned signal of `%s' is declared" (plist-get unit :name))
+      (save-excursion
+        (goto-char (sv-kit--declaration-point unit tree))
+        (dolist (name (sort missing #'string<))
+          (insert (format "logic %s;\n" name)))
+        (let ((end (point)))
+          (sv-format-region (line-beginning-position
+                             (- (length missing)))
+                            end)))
+      (message "Declared %d signal(s): %s"
+               (length missing) (string-join (sort missing #'string<) ", ")))))
+
+(defun sv-kit--declaration-point (unit tree)
+  "Return where a new declaration belongs inside UNIT of TREE."
+  (let ((line (plist-get unit :line)))
+    (dolist (item (plist-get unit :items))
+      (when (memq (plist-get item :type) '(decl param genvar typedef import))
+        (setq line (max line (plist-get item :line)))))
+    (ignore tree)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line line)
+      (line-beginning-position))))
+
 ;;;; Minor mode
 
 (defvar sv-kit-mode-map
@@ -326,6 +396,8 @@ filled in for you."
     (define-key map (kbd "C-c C-r") #'sv-format-region)
     (define-key map (kbd "C-c C-l") #'sv-kit-lint)
     (define-key map (kbd "C-c C-i") #'sv-kit-insert-instance)
+    (define-key map (kbd "C-c C-p") #'sv-kit-update-instance)
+    (define-key map (kbd "C-c C-d") #'sv-kit-declare-missing-signals)
     (define-key map (kbd "C-c C-u") #'sv-kit-goto-unit)
     map)
   "Keymap of `sv-kit-mode'.")
@@ -350,11 +422,13 @@ filled in for you."
           (setq-local indent-line-function #'sv-format-indent-line))
         (setq-local imenu-create-index-function #'sv-kit-imenu-index)
         (add-hook 'flymake-diagnostic-functions #'sv-kit-flymake-backend nil t)
+        (sv-ide-setup)
         (add-hook 'before-save-hook #'sv-kit--maybe-format nil t)
         (when (bound-and-true-p flymake-mode) (flymake-start)))
     (kill-local-variable 'indent-line-function)
     (kill-local-variable 'imenu-create-index-function)
     (remove-hook 'flymake-diagnostic-functions #'sv-kit-flymake-backend t)
+    (sv-ide-teardown)
     (remove-hook 'before-save-hook #'sv-kit--maybe-format t)))
 
 ;;;###autoload
