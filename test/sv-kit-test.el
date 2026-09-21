@@ -16,6 +16,7 @@
 (require 'sv-lint)
 (require 'sv-format)
 (require 'sv-kit)
+(require 'sv-mode)
 
 (defun sv-test-types (text)
   "Return the type of every significant token of TEXT."
@@ -642,6 +643,119 @@ endmodule"))))
     (should (equal (buffer-string)
                    "module test (input logic i_a, output logic o_q);\n  assign o_q = i_a;\nendmodule\n"))
     (should-not (sv-lint-buffer))))
+
+
+;;;; Major mode
+
+
+(defun sv-test-fontify (text)
+  "Return a temporary buffer holding TEXT fontified in `sv-mode'."
+  (let ((buffer (generate-new-buffer " *sv-test*")))
+    (with-current-buffer buffer
+      (insert text)
+      (sv-mode)
+      (font-lock-mode 1)
+      (font-lock-ensure))
+    buffer))
+
+(defun sv-test-face (text needle &optional occurrence)
+  "Return the face `sv-mode' gives to NEEDLE inside TEXT.
+OCCURRENCE selects which match to look at, counting from one."
+  (let ((buffer (sv-test-fontify text)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          (when (search-forward needle nil t (or occurrence 1))
+            (let ((face (get-text-property (match-beginning 0) 'face)))
+              (if (listp face) (car face) face))))
+      (kill-buffer buffer))))
+
+(ert-deftest sv-mode-highlights-keywords-types-and-literals ()
+  (let ((text "module m;\n  logic [3:0] r_data;\n  assign r_data = 4'hf;\nendmodule\n"))
+    (should (eq (sv-test-face text "module") 'font-lock-keyword-face))
+    (should (eq (sv-test-face text "logic") 'font-lock-type-face))
+    (should (eq (sv-test-face text "r_data") 'font-lock-variable-name-face))
+    (should (eq (sv-test-face text "4'hf") 'font-lock-constant-face))
+    (should (eq (sv-test-face text "assign") 'font-lock-keyword-face))))
+
+(ert-deftest sv-mode-highlights-directives-rather-than-their-keyword ()
+  (let ((text "`ifdef A\n`else\n`endif\n"))
+    (should (eq (sv-test-face text "`else") 'sv-mode-directive-face))
+    ;; The `else' inside `\=`else' must not be read as the keyword.
+    (should (eq (sv-test-face text "else") 'sv-mode-directive-face))))
+
+(ert-deftest sv-mode-highlights-design-unit-names ()
+  (let ((text "module top (input logic i_a, output logic o_b);\nendmodule : top\n"))
+    (should (eq (sv-test-face text "top") 'font-lock-function-name-face))
+    (should (eq (sv-test-face text "top" 2) 'sv-mode-label-face))
+    (should (eq (sv-test-face text "i_a") 'font-lock-variable-name-face))
+    (should (eq (sv-test-face text "o_b") 'font-lock-variable-name-face))))
+
+(ert-deftest sv-mode-highlights-instances-and-connections ()
+  (let ((text "module m;\n  sub #(.W (2)) u_sub (.i_clk (clk), .o_q (q));\nendmodule\n"))
+    (should (eq (sv-test-face text "sub") 'font-lock-type-face))
+    (should (eq (sv-test-face text "u_sub") 'sv-mode-instance-face))
+    (should (eq (sv-test-face text ".i_clk") 'sv-mode-port-face))
+    (should (eq (sv-test-face text ".W") 'sv-mode-port-face))))
+
+(ert-deftest sv-mode-highlights-types-the-file-declares ()
+  (let ((text "module m;\n  typedef enum logic [1:0] { IDLE, RUN } state_t;\n  state_t r_state;\n  always_comb r_state = IDLE;\nendmodule\n"))
+    (should (eq (sv-test-face text "state_t" 2) 'font-lock-type-face))
+    (should (eq (sv-test-face text "r_state") 'font-lock-variable-name-face))
+    (should (eq (sv-test-face text "IDLE" 2) 'font-lock-constant-face))))
+
+(ert-deftest sv-mode-leaves-comments-and-strings-alone ()
+  (let ((text "module m;\n  // module logic assign\n  initial $display(\"module logic\");\nendmodule\n"))
+    (should (eq (sv-test-face text "module logic assign") 'font-lock-comment-face))
+    (should (eq (sv-test-face text "\"module logic\"") 'font-lock-string-face))
+    (should (eq (sv-test-face text "$display") 'font-lock-builtin-face))))
+
+(ert-deftest sv-mode-treats-an-apostrophe-as-punctuation ()
+  ;; A literal such as 4'b0 must not open a string that swallows the rest.
+  (let ((text "module m;\n  assign x = 4'b0;\n  // plain comment\nendmodule\n"))
+    (should (eq (sv-test-face text "plain comment") 'font-lock-comment-face))
+    (should (eq (sv-test-face text "endmodule") 'font-lock-keyword-face))))
+
+(ert-deftest sv-mode-matchers-always-advance ()
+  ;; A matcher that rejects a match must still move point, or font-lock spins.
+  (let ((buffer (generate-new-buffer " *sv-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (insert "module top;\n  logic [3:0] r_data;\n  always @(posedge c or negedge r) q <= 1;\nendmodule\n")
+          (sv-mode)
+          (dolist (matcher (list #'sv-mode--match-declaration
+                                 #'sv-mode--match-instance
+                                 #'sv-mode--match-parameter))
+            (goto-char (point-min))
+            (let ((previous -1) (steps 0))
+              (while (and (< steps 200) (funcall matcher (point-max)))
+                (should (> (point) previous))
+                (setq previous (point))
+                (setq steps (1+ steps)))
+              (should (< steps 200)))))
+      (kill-buffer buffer))))
+
+(ert-deftest sv-mode-indents-with-tab-and-indent-region ()
+  (with-temp-buffer
+    (insert "module m;\nalways_comb begin\nx = 1;\nend\nendmodule\n")
+    (sv-mode)
+    (indent-region (point-min) (point-max))
+    (should (equal (buffer-string)
+                   "module m;\n  always_comb begin\n    x = 1;\n  end\nendmodule\n"))))
+
+(ert-deftest sv-mode-navigates-to-the-enclosing-unit ()
+  (with-temp-buffer
+    (insert "module first;\nendmodule\nmodule second;\n  logic x;\nendmodule\n")
+    (sv-mode)
+    (goto-char (point-min))
+    (search-forward "logic x")
+    (should (equal (sv-mode-current-defun) "second"))
+    (beginning-of-defun)
+    (should (looking-at-p "module second"))))
+
+(ert-deftest sv-mode-claims-verilog-file-names ()
+  (dolist (name '("foo.sv" "foo.svh" "foo.v" "foo.vh"))
+    (should (eq (assoc-default name auto-mode-alist #'string-match-p) #'sv-mode))))
 
 (provide 'sv-kit-test)
 

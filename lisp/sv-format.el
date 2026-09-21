@@ -558,6 +558,26 @@ start of the buffer so that the region's nesting is known."
     (sv-format--replace-lines (point-min) (point-max) formatted)))
 
 ;;;###autoload
+(defun sv-format-indent-region (beg end)
+  "Reindent every line between BEG and END, touching only leading whitespace.
+Suitable as an `indent-region-function': unlike `sv-format-region' it
+leaves the rest of each line alone, and it lexes the buffer once instead
+of once per line."
+  (interactive "r")
+  (let* ((tokens (sv-lex (point-min) (point-max)))
+         (indents (sv-format--indent-table tokens))
+         (end-marker (copy-marker end)))
+    (save-excursion
+      (goto-char beg)
+      (beginning-of-line)
+      (while (< (point) end-marker)
+        (let ((column (gethash (line-number-at-pos (point)) indents)))
+          (when (and column (not (looking-at-p "[ \t]*$")))
+            (indent-line-to column)))
+        (forward-line 1)))
+    (set-marker end-marker nil)))
+
+;;;###autoload
 (defun sv-format-indent-line ()
   "Indent the current line as SystemVerilog.
 Suitable as an `indent-line-function'."

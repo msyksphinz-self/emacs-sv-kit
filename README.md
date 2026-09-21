@@ -1,9 +1,9 @@
 # sv-kit — Emacs 向け SystemVerilog パーサ / リンタ / フォーマッタ
 
 SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 → 構文解析 → 構文木**
-を経由して扱う Emacs Lisp パッケージです。同じ構文木の上に、リンタ・フォーマッタ・
-imenu・インスタンス雛形生成を載せています。外部ツール（Verilator, Verible など）の
-インストールは不要で、Emacs 単体で完結します。
+を経由して扱う Emacs Lisp パッケージです。同じ構文木の上に、ハイライト・リンタ・
+フォーマッタ・インデント・imenu・インスタンス雛形生成を載せています。外部ツール
+（Verilator, Verible など）も他の Verilog パッケージも不要で、Emacs 単体で完結します。
 
 | ファイル | 役割 |
 | --- | --- |
@@ -12,23 +12,68 @@ imenu・インスタンス雛形生成を載せています。外部ツール（
 | `lisp/sv-lint.el` | 構文木に対する静的チェック（23 ルール）とプラグマによる抑制 |
 | `lisp/sv-format.el` | インデント再計算・空白正規化・桁揃え |
 | `lisp/sv-kit.el` | Emacs 統合（Flymake / imenu / キーバインド）と CLI |
+| `lisp/sv-mode.el` | メジャーモード。シンタックステーブル・ハイライト・インデント・移動 |
 | `bin/sv-kit` | コマンドライン版（CI 用） |
 
 ## インストール
 
 ```elisp
 (add-to-list 'load-path "/path/to/scariv/tools/emacs-sv-kit/lisp")
-(require 'sv-kit)
-(add-hook 'verilog-mode-hook #'sv-kit-mode)   ; verilog-ts-mode でも可
-(add-hook 'verilog-mode-hook #'flymake-mode)  ; 保存せずに指摘を表示したい場合
+(require 'sv-mode)
 ```
 
-`sv-kit-mode` はマイナーモードなので、既存の `verilog-mode` / `verilog-ts-mode` の
-フォントロックや設定はそのまま使えます。
+これだけで `.sv` / `.svh` / `.v` / `.vh` が `sv-mode` で開き、**ハイライト・
+インデント・lint（Flymake）** が有効になります。追加設定は要りません。
+
+既存の `verilog-mode` / `verilog-ts-mode` を使い続けたい場合は、マイナーモードの
+`sv-kit-mode` だけを重ねられます（ハイライトとインデントは元のモードのものが使われ、
+lint・整形・imenu・インスタンス挿入だけが追加されます）。
+
+```elisp
+(require 'sv-kit)
+(add-hook 'verilog-mode-hook #'sv-kit-mode)
+(add-hook 'verilog-mode-hook #'flymake-mode)
+```
+
+## ハイライト
+
+font-lock はパーサではなく正規表現で行うので入力中でも軽量ですが（実測: 24 ファイル
+27 KB を 0.13 秒で fontify）、**その場で宣言された型名だけはパーサから取得**します。
+つまり自分で書いた `typedef` も組み込み型と同じように色が付きます。
+
+色分けの対象:
+
+- キーワード / データ型（`logic`, `wire`, `parameter`, `typedef` …）
+- 数値リテラル（`8'hff`, `'0`, `1.5e-3`, `10ns`）と文字列
+- コンパイラ指令とマクロ（`` `ifdef ``、`` `else `` はキーワード `else` と誤認しない）
+- `module` / `interface` / `package` / `class` / `function` / `task` の名前
+- 宣言された信号名・パラメータ名・ループ変数（`for (int i = 0; ...)` の `i` も）
+- インスタンス（モジュール名と `u_foo` のインスタンス名を区別）
+- `.i_clk (clk)` のポート名、`begin : name` / `endmodule : name` のラベル
+- ファイル内で `typedef` された型名と enum リテラル
+
+顔（face）は `sv-mode-port-face` / `sv-mode-label-face` / `sv-mode-directive-face` /
+`sv-mode-instance-face` としてカスタマイズできます。色数を減らしたいときは
+`font-lock-maximum-decoration` を 1 か 2 にしてください。`typedef` を書き足した直後に
+色を反映させたい場合は `C-c C-t`（`sv-mode-update-user-types`、保存時には自動実行）。
+
+## インデント
+
+インデントはパーサと同じトークン列から計算するので、正規表現では難しいケース
+（`begin` の無い `if` / `else` の連鎖、`case` の項目、複数行のポートリスト、
+`generate` の中）も崩れません。`end` は必ず対応する `begin` の**行頭桁**に戻ります。
+
+- `TAB` … その行をインデント（`sv-format-indent-line`）
+- `C-M-\` … リージョンをインデント（`sv-format-indent-region`、バッファを 1 回だけ字句解析）
+- `end` や `else` を打った瞬間に行が再インデントされます
+  （不要なら `(setq sv-mode-electric-keywords nil)`）
+
+インデントだけでなく空白の正規化や桁揃えまで行いたい場合は後述のフォーマッタ
+（`C-c C-f`）を使ってください。
 
 ## キーバインド
 
-`sv-kit-mode` 有効時:
+`sv-mode`（および `sv-kit-mode`）有効時:
 
 | キー | コマンド | 内容 |
 | --- | --- | --- |
@@ -37,12 +82,17 @@ imenu・インスタンス雛形生成を載せています。外部ツール（
 | `C-c C-l` | `sv-kit-lint` | 指摘を `compilation-mode` バッファに一覧（`M-g n` でジャンプ） |
 | `C-c C-i` | `sv-kit-insert-instance` | プロジェクト内のモジュールからインスタンス雛形を挿入 |
 | `C-c C-u` | `sv-kit-goto-unit` | ファイル内の design unit へジャンプ |
+| `C-c C-t` | `sv-mode-update-user-types` | `typedef` を読み直してハイライトを更新 |
+| `C-M-a` / `C-M-e` | `beginning-of-defun` / `end-of-defun` | module / function 単位で移動 |
 
-`TAB`（`sv-format-indent-line`）もパーサ由来のインデントになります。無効化するには
-`(setq sv-kit-use-indent-function nil)`。保存時に自動整形したい場合は
-`M-x sv-kit-format-on-save-mode`、あるいは `(setq sv-kit-format-on-save t)`。
+保存時に自動整形したい場合は `M-x sv-kit-format-on-save-mode`、あるいは
+`(setq sv-kit-format-on-save t)`。
 
 ## リンタ
+
+`sv-mode` では Flymake が既定で有効なので、編集しながら指摘が表示されます
+（切るには `(setq sv-mode-enable-flymake nil)`）。`C-c C-l` で一覧表示、
+`M-x sv-kit-lint-project` でプロジェクト全体を検査できます。
 
 `always_ff` 内のブロッキング代入、`always_comb` から生まれるラッチ、default の無い
 case、未宣言 / 未使用の信号、駆動されない出力、位置指定のポート接続などを検出します。
@@ -153,7 +203,7 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 59 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 70 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして
