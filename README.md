@@ -9,8 +9,9 @@ SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 
 | --- | --- |
 | `lisp/sv-lexer.el` | トークナイザ。コメント・空白も保持するので原文復元が可能 |
 | `lisp/sv-parser.el` | 再帰下降パーサ。design unit / ポート / 宣言 / 手続き文 / インスタンスを構文木に |
-| `lisp/sv-lint.el` | 構文木に対する静的チェック（27 ルール）とプラグマによる抑制 |
+| `lisp/sv-lint.el` | 構文木に対する静的チェック（30 ルール）とプラグマによる抑制 |
 | `lisp/sv-format.el` | インデント再計算・空白正規化・桁揃え |
+| `lisp/sv-width.el` | 定数式の畳み込みとビット幅推論 |
 | `lisp/sv-index.el` | バッファ／プロジェクトのシンボル索引（ファイル単位でキャッシュ） |
 | `lisp/sv-ide.el` | 補完・定義ジャンプ（xref）・ElDoc |
 | `lisp/sv-kit.el` | Emacs 統合（Flymake / imenu / キーバインド）と CLI |
@@ -165,12 +166,42 @@ common/rtl/bit/bit_cnt.sv:14:1: warning: `lo' is declared but never used. [unuse
 - `instance-unknown-port` / `instance-missing-port` — 同一プロジェクト内の
   モジュール定義と突き合わせたポート名の検査
 - `positional-port-connection` / `unconnected-port`
+- `width-truncation` — 代入で上位ビットが落ちる（幅推論に基づく）
+- `constant-overflow` — 定数が代入先の幅に収まらない
+- `port-width-mismatch` — インスタンス接続の幅がポート幅と違う（既定では無効）
 - `multiple-drivers` — 同じ信号を複数の always / assign が駆動（部分選択は除外）
 - `assignment-to-input` — 入力ポートへの代入
 - `duplicate-case-label` — 同じ case ラベルが 2 回現れる（後者は到達不能）
 - `mixed-assignment-style` — 1 つの `always` 内で `=` と `<=` が混在
 - `module-filename-mismatch`, `unlabeled-generate-block`, `duplicate-declaration`
 - `line-too-long`, `trailing-whitespace`, `tab-indentation`
+
+### ビット幅の検査
+
+`sv-width.el` が**定数式を畳み込み**、そこから**式のビット幅を推論**します。
+パラメータは相互参照も解決し（`localparam PTR = $clog2(D)` のような連鎖も可）、
+`$clog2` / `$bits` / キャスト / packed struct / 多次元も扱います。
+
+```systemverilog
+logic [7:0] i_a;
+logic [3:0] o_q;
+assign o_q = i_a;        // width-truncation: 4 ビットに 8 ビットを代入
+assign o_q = 5'd20;      // constant-overflow: 20 は 4 ビットに入らない
+```
+
+誤検知を避けるため、**分からないものは黙る**方針で作ってあります。
+
+- 幅が確定しない式（型パラメータ、未解決の型、評価できないパラメータ）は
+  無検査。「幅指定はあるが評価できない」場合に 1 ビットと決めつけません
+- サイズ無し即値（`42`, `'0`）は文脈依存なので幅比較の対象外。ただし
+  「定数の値が入らない」場合だけは指摘します
+- **`generate` の条件を評価**し、実際に展開される枝だけを検査します
+  （`if (Width == 1)` の枝を Width=8 の前提で見る、といった誤りをしません）
+- 配列要素 `x[i]` を 1 ビットと決めつけません（構造体配列なら要素幅）
+
+`port-width-mismatch` はモジュールを跨ぐ検査で、パラメータ上書きを評価した上で
+比較しますが、型パラメータを多用する設計では精度が落ちるため既定では無効です。
+有効にするには `(setq sv-lint-disabled-rules (delq 'port-width-mismatch sv-lint-disabled-rules))`。
 
 ### 指摘の抑制
 
@@ -256,7 +287,7 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 100 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 107 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして
@@ -273,8 +304,9 @@ $ make check   # byte-compile（警告はエラー扱い）+ ERT 100 テスト
 
 - パースエラー **0 件**
 - フォーマッタはトークン列を 1 つも変えず（意味不変）、冪等性も **全ファイルで成立**
-- lint の指摘は 1939 → 992 件まで精査。`duplicate-declaration` の誤検知は
+- lint の指摘は 1939 → 979 件まで精査。`duplicate-declaration` の誤検知は
   スコープ／`` `ifdef `` 分岐を考慮して **0 件** になりました
+- 幅検査は 225 ファイルで 9 件（いずれも実在の切り詰め）。SCARIV の RTL では 0 件
 
 この検証で見つかったパーサの不具合（`` `endif `` 直後の `endmodule` の取りこぼし、
 代入パターン `'{...}` の括弧不整合、マクロ文が次の文を飲み込む問題など）は

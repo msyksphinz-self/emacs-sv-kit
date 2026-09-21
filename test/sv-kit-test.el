@@ -19,6 +19,7 @@
 (require 'sv-mode)
 (require 'sv-index)
 (require 'sv-ide)
+(require 'sv-width)
 
 (defun sv-test-types (text)
   "Return the type of every significant token of TEXT."
@@ -884,6 +885,126 @@ OCCURRENCE selects which match to look at, counting from one."
   (dolist (name '("foo.sv" "foo.svh" "foo.v" "foo.vh"))
     (should (eq (assoc-default name auto-mode-alist #'string-match-p) #'sv-mode))))
 
+
+;;;; Constant folding and width inference
+
+(defun sv-test-width-context (source)
+  "Return a width context for the first design unit of SOURCE."
+  (sv-width-context (sv-test-unit source)))
+
+(defun sv-test-expression (text)
+  "Return the significant tokens of the expression TEXT."
+  (cl-remove-if #'sv-token-trivia-p (sv-lex-string text)))
+
+(defconst sv-test-width-source
+  "module m #(parameter int W = 8, parameter int D = 4) ();
+     localparam int PTR = $clog2(D);
+     typedef logic [W-1:0] word_t;
+     typedef struct packed { logic v; logic [7:0] d; } entry_t;
+     logic [W-1:0] a, a2;
+     logic [3:0]   b;
+     word_t        c;
+     entry_t       e;
+     logic         x;
+     logic [3:0]   mem [8];
+   endmodule"
+  "A module exercising the shapes the width engine has to handle.")
+
+(ert-deftest sv-width-folds-constant-expressions ()
+  (let ((context (sv-test-width-context sv-test-width-source)))
+    (should (= (sv-width-eval (sv-test-expression "W") context) 8))
+    (should (= (sv-width-eval (sv-test-expression "PTR") context) 2))
+    (should (= (sv-width-eval (sv-test-expression "$clog2(D)") context) 2))
+    (should (= (sv-width-eval (sv-test-expression "W*2+1") context) 17))
+    (should (= (sv-width-eval (sv-test-expression "(W > 4) ? 10 : 20") context) 10))
+    (should (= (sv-width-eval (sv-test-expression "8'hff") context) 255))
+    (should-not (sv-width-eval (sv-test-expression "unknown_name") context))))
+
+(ert-deftest sv-width-reads-declared-widths ()
+  (let ((context (sv-test-width-context sv-test-width-source)))
+    (should (= (sv-width-signal "a" context) 8))
+    ;; A later declarator inherits the dimensions of the first.
+    (should (= (sv-width-signal "a2" context) 8))
+    (should (= (sv-width-signal "b" context) 4))
+    (should (= (sv-width-signal "c" context) 8))
+    ;; A packed struct is as wide as its members together.
+    (should (= (sv-width-signal "e" context) 9))
+    (should (= (sv-width-signal "x" context) 1))))
+
+(ert-deftest sv-width-infers-expression-widths ()
+  (let* ((context (sv-test-width-context sv-test-width-source))
+         (width (lambda (text)
+                  (sv-width-of (sv-test-expression text) context))))
+    (should (= (funcall width "a + b") 8))
+    (should (= (funcall width "{a, b}") 12))
+    (should (= (funcall width "{4{b}}") 16))
+    (should (= (funcall width "a[3:0]") 4))
+    (should (= (funcall width "a[2]") 1))
+    (should (= (funcall width "a[1+:3]") 3))
+    (should (= (funcall width "a == b") 1))
+    (should (= (funcall width "|a") 1))
+    (should (= (funcall width "|a | x") 1))
+    (should (= (funcall width "-b") 4))
+    (should (= (funcall width "a << 2") 8))
+    (should (= (funcall width "x ? a : c") 8))
+    (should (= (funcall width "word_t'(b)") 8))
+    ;; An unsized literal takes its width from the context, so it has none.
+    (should-not (funcall width "42"))
+    (should-not (funcall width "'0"))
+    ;; An element of an array is not one bit, and its width is not guessed.
+    (should-not (funcall width "mem[2]"))))
+
+(ert-deftest sv-lint-finds-a-truncating-assignment ()
+  (let ((rules (sv-test-rules "module test (input logic [7:0] i_a, output logic [3:0] o_q);
+                                 assign o_q = i_a;
+                               endmodule")))
+    (should (memq 'width-truncation rules)))
+  (should-not
+   (memq 'width-truncation
+         (sv-test-rules "module test (input logic [3:0] i_a, output logic [7:0] o_q);
+                           assign o_q = i_a;
+                         endmodule"))))
+
+(ert-deftest sv-lint-finds-a-constant-that-does-not-fit ()
+  (should (memq 'constant-overflow
+                (sv-test-rules "module test (output logic [3:0] o_q);
+                                  assign o_q = 5'd20;
+                                endmodule")))
+  (should-not
+   (memq 'constant-overflow
+         (sv-test-rules "module test (output logic [3:0] o_q);
+                           assign o_q = 4'hf;
+                         endmodule"))))
+
+(ert-deftest sv-lint-respects-the-generate-branch-that-is-elaborated ()
+  ;; With Width at 1 the taken branch assigns one bit to one bit; the branch
+  ;; that is not elaborated must not be judged.
+  (should-not
+   (memq 'width-truncation
+         (sv-test-rules "module test #(parameter int Width = 1)
+                                     (input logic [Width-1:0] i_d, output logic o_q);
+                           if (Width == 1) begin : gen_one
+                             assign o_q = i_d;
+                           end else begin : gen_many
+                             assign o_q = |i_d;
+                           end
+                         endmodule"))))
+
+(ert-deftest sv-lint-checks-port-widths-with-overrides ()
+  (let* ((table (sv-lint-module-table
+                 (sv-parse-string "module sub #(parameter int N = 8)
+                                     (input logic [N-1:0] i_d);
+                                   endmodule")))
+         (sv-lint-disabled-rules '())
+         (rules (mapcar #'sv-diagnostic-rule
+                        (sv-lint-analyze
+                         "module test (output logic o_q);
+                            logic [7:0] w_wide;
+                            sub #(.N(4)) u_sub (.i_d (w_wide));
+                            assign o_q = |w_wide;
+                          endmodule"
+                         "test.sv" table))))
+    (should (memq 'port-width-mismatch rules))))
 
 ;;;; Project index and editor services
 

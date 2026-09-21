@@ -3,7 +3,7 @@ EMACS ?= emacs
 BATCH  = $(EMACS) --batch -Q -L lisp
 
 LISP  = lisp/sv-lexer.el lisp/sv-parser.el lisp/sv-lint.el \
-        lisp/sv-format.el lisp/sv-index.el lisp/sv-ide.el \
+        lisp/sv-format.el lisp/sv-width.el lisp/sv-index.el lisp/sv-ide.el \
         lisp/sv-kit.el lisp/sv-mode.el
 TESTS = test/sv-kit-test.el
 RTL  ?= $(shell find ../../common -name '*.sv' 2>/dev/null)

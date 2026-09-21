@@ -309,7 +309,7 @@ before it are packed dimensions and those after it unpacked ones."
   "Parse the module port list TOKENS, minus its enclosing parentheses.
 Directions and types are inherited from the previous port when omitted,
 as the ANSI header rules require."
-  (let ((dir nil) (datatype nil) (ports '()))
+  (let ((dir nil) (datatype nil) (packed nil) (ports '()))
     (dolist (group (sv-parse-split-commas tokens))
       (let* ((port (sv-parse-declarator group))
              (interface (and (null (plist-get port :dir))
@@ -321,8 +321,12 @@ as the ANSI header rules require."
          (t (setq port (plist-put port :dir dir))))
         (if (and (plist-get port :datatype)
                  (not (string-empty-p (plist-get port :datatype))))
-            (setq datatype (plist-get port :datatype))
-          (setq port (plist-put port :datatype datatype)))
+            (setq datatype (plist-get port :datatype)
+                  packed (plist-get port :packed))
+          (setq port (plist-put port :datatype datatype))
+          ;; `input logic [7:0] a, b\=' makes b as wide as a.
+          (unless (plist-get port :packed)
+            (setq port (plist-put port :packed packed))))
         (when (plist-get port :name)
           (push port ports))))
     (nreverse ports)))
@@ -599,7 +603,10 @@ Handles plain targets, bit selects and concatenations."
           (let ((decl (sv-parse-declarator group)))
             (unless (and (plist-get decl :datatype)
                          (not (string-empty-p (plist-get decl :datatype))))
-              (setq decl (plist-put decl :datatype (plist-get base :datatype))))
+              (setq decl (plist-put decl :datatype (plist-get base :datatype)))
+              ;; `logic [7:0] a, b;\=' declares two bytes, not a byte and a bit.
+              (unless (plist-get decl :packed)
+                (setq decl (plist-put decl :packed (plist-get base :packed)))))
             (when (plist-get decl :name) (push decl names))))
         (list :type 'decl
               :enum-members (sv-parse--enum-members tokens)
@@ -660,10 +667,25 @@ TOKENS must actually introduce an enumeration."
                       (when (<= depth 0) (setq done t)))))
                 (equal (sv-parse--text next) "("))))))
 
+(defun sv-parse--strip-leading-directives (tokens)
+  "Return TOKENS without the compiler directives it starts with.
+A port or parameter list may be split by `\=`ifdef\=', which otherwise hides
+the connection that follows from the parser."
+  (while (and tokens (eq (sv-token-type (car tokens)) 'directive))
+    (let ((line (sv-token-line (car tokens)))
+          (takes-line (member (sv-token-text (car tokens))
+                              sv-parse--line-directives)))
+      (setq tokens (cdr tokens))
+      (when takes-line
+        (while (and tokens (= (sv-token-line (car tokens)) line))
+          (setq tokens (cdr tokens))))))
+  tokens)
+
 (defun sv-parse--connections (tokens)
   "Parse instance port connections from TOKENS, minus enclosing parentheses."
   (let ((connections '()) (index 0))
     (dolist (group (sv-parse-split-commas tokens))
+      (setq group (sv-parse--strip-leading-directives group))
       (when group
         (let ((first (car group)))
           (if (equal (sv-token-text first) ".")

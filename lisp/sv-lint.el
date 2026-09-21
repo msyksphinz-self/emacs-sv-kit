@@ -27,6 +27,7 @@
 (require 'subr-x)
 (require 'sv-lexer)
 (require 'sv-parser)
+(require 'sv-width)
 
 (defgroup sv-lint nil
   "Linting for SystemVerilog sources."
@@ -58,6 +59,9 @@
     (assignment-to-input        error   "Input port is assigned to.")
     (duplicate-case-label       warning "Case label appears twice in one statement.")
     (mixed-assignment-style     warning "Block mixes blocking and non-blocking assignments.")
+    (width-truncation           warning "Assignment drops the upper bits of its value.")
+    (constant-overflow          warning "Constant does not fit in what it is assigned to.")
+    (port-width-mismatch        warning "Instance connects a port to a signal of another width.")
     (positional-port-connection warning "Instance connects ports by position.")
     (unconnected-port           info    "Instance port is left unconnected.")
     (instance-unknown-port      error   "Instance connects a port the module does not have.")
@@ -73,7 +77,7 @@
   "Every rule: its identifier, default severity and one-line description.")
 
 (defcustom sv-lint-disabled-rules
-  '(port-naming legacy-net-type unconnected-port)
+  '(port-naming legacy-net-type unconnected-port port-width-mismatch)
   "Rules that are not run at all.
 Every identifier of `sv-lint-rule-alist' is accepted."
   :type '(repeat symbol)
@@ -791,6 +795,111 @@ part select, which several blocks may legitimately share."
           (sv-lint--report ctx 'mixed-assignment-style (plist-get node :line) nil
                            "This block mixes blocking and non-blocking assignments."))))))
 
+(defun sv-lint--live-statements (node widths)
+  "Return the statements of NODE that the parameters really elaborate.
+A generate branch whose condition folds to false is not compiled, and one
+whose condition cannot be folded might not be, so neither is analysed."
+  (let ((found '()))
+    (cl-labels
+        ((walk (item)
+           (when (and item (listp item) (plist-member item :type))
+             (if (eq (plist-get item :type) 'generate-if)
+                 (let* ((tokens (plist-get item :cond))
+                        (inside (if (and tokens
+                                         (equal (sv-token-text (car tokens)) "("))
+                                    (butlast (cdr tokens))
+                                  tokens))
+                        (value (sv-width-eval inside widths)))
+                   (cond ((null value) nil)
+                         ((/= value 0) (walk (plist-get item :then)))
+                         (t (walk (plist-get item :else)))))
+               (push item found)
+               (dolist (key '(:items :stmts :body :then :else))
+                 (let ((value (plist-get item key)))
+                   (cond
+                    ((and (listp value) (plist-member value :type)) (walk value))
+                    ((listp value) (mapc #'walk value)))))
+               (dolist (arm (plist-get item :items))
+                 (when (and (listp arm) (plist-member arm :stmt))
+                   (walk (plist-get arm :stmt))))))))
+      (walk node))
+    (nreverse found)))
+
+(defun sv-lint--assignment-pairs (unit &optional widths)
+  "Return the (LHS RHS LINE) triples UNIT assigns, procedural ones included.
+With WIDTHS, only the generate branches that are really elaborated count."
+  (let ((pairs '()))
+    (dolist (stmt (if widths
+                      (sv-lint--live-statements unit widths)
+                    (sv-parse-statements unit)))
+      (when (and (memq (plist-get stmt :type) '(assign continuous-assign))
+                 (member (plist-get stmt :op) '(nil "=" "<="))
+                 (plist-get stmt :lhs)
+                 (plist-get stmt :rhs))
+        (push (list (plist-get stmt :lhs) (plist-get stmt :rhs)
+                    (plist-get stmt :line))
+              pairs)))
+    (nreverse pairs)))
+
+(defun sv-lint--rule-width (ctx unit)
+  "Check UNIT for assignments and connections that do not fit."
+  (let ((widths (sv-width-context unit)))
+    (dolist (pair (sv-lint--assignment-pairs unit widths))
+      (let* ((lhs (nth 0 pair))
+             (rhs (nth 1 pair))
+             (line (nth 2 pair))
+             (target (sv-width-of lhs widths)))
+        (when target
+          (let ((value (sv-width-eval rhs widths))
+                (source (sv-width-of rhs widths)))
+            (cond
+             ;; A constant that simply does not fit is always a mistake.
+             ((and value (>= value 0) (< target 62) (>= value (ash 1 target)))
+              (sv-lint--report ctx 'constant-overflow line nil
+                               (format "%d does not fit in the %d bit%s of `%s'."
+                                       value target (if (= target 1) "" "s")
+                                       (or (car (sv-parse--lhs-targets lhs)) "target"))))
+             ;; Otherwise compare the widths, but only when both are known.
+             ((and source (> source target) (null value))
+              (sv-lint--report ctx 'width-truncation line nil
+                               (format "`%s' is %d bit%s wide but is assigned %d bits."
+                                       (or (car (sv-parse--lhs-targets lhs)) "target")
+                                       target (if (= target 1) "" "s") source))))))))
+
+    (let ((modules (sv-lint-context-modules ctx)))
+      (when modules
+        (dolist (instance (sv-parse-collect unit 'instance))
+          (let ((target (gethash (plist-get instance :module) modules)))
+            (when (and (listp target) (plist-get target :ports))
+              (let* ((overrides
+                      (delq nil
+                            (mapcar
+                             (lambda (param)
+                               (let ((value (sv-width-eval (plist-get param :expr)
+                                                           widths)))
+                                 (when (and (plist-get param :name) value)
+                                   (cons (plist-get param :name) value))))
+                             (plist-get instance :params))))
+                     (inner (sv-width-context target overrides)))
+                (dolist (sibling (plist-get instance :siblings))
+                  (dolist (connection (plist-get sibling :connections))
+                    (let ((port (cl-find (plist-get connection :name)
+                                         (plist-get target :ports)
+                                         :key (lambda (p) (plist-get p :name))
+                                         :test #'equal)))
+                      (when (and port (plist-get connection :expr))
+                        (let ((expected (sv-width-declarator port inner))
+                              (actual (sv-width-of (plist-get connection :expr)
+                                                   widths)))
+                          (when (and expected actual (/= expected actual))
+                            (sv-lint--report-token
+                             ctx 'port-width-mismatch (plist-get connection :token)
+                             (format "Port `%s' of `%s' is %d bit%s wide but is connected to %d."
+                                     (plist-get connection :name)
+                                     (plist-get instance :module)
+                                     expected (if (= expected 1) "" "s")
+                                     actual))))))))))))))))
+
 ;;;; Entry points
 
 (defun sv-lint-module-table (tree &optional table)
@@ -846,6 +955,7 @@ MODULES is an optional table of known design units, as built by
         (sv-lint--rule-drivers ctx unit)
         (sv-lint--rule-case-labels ctx unit)
         (sv-lint--rule-assignment-style ctx unit)
+        (sv-lint--rule-width ctx unit)
         (sv-lint--rule-instances ctx unit)
         (sv-lint--rule-generate ctx unit)
         (sv-lint--rule-unit-style ctx unit)))
