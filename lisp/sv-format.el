@@ -361,7 +361,7 @@ HAD-SPACE says whether the source had whitespace between the two."
   (let ((significant (cl-remove-if #'sv-token-trivia-p tokens)))
     (when (and (cdr significant)
                (member (sv-token-text (car significant))
-                       sv-parse--direction-keywords))
+                       sv-parse-direction-keywords))
       (cadr significant))))
 
 (defun sv-format--declaration-anchor (tokens)
@@ -369,7 +369,7 @@ HAD-SPACE says whether the source had whitespace between the two."
   (let* ((significant (cl-remove-if #'sv-token-trivia-p tokens))
          (first (car significant)))
     (when (and first
-               (or (member (sv-token-text first) sv-parse--direction-keywords)
+               (or (member (sv-token-text first) sv-parse-direction-keywords)
                    (member (sv-token-text first) sv-lexer-data-types)
                    (member (sv-token-text first) sv-lexer-net-types)
                    ;; A user-defined type: `entry_t e;' or `pkg::entry_t e;'.
@@ -382,7 +382,7 @@ HAD-SPACE says whether the source had whitespace between the two."
       (let* ((stop (or (sv-parse-find-top significant '("," ";"))
                        (length significant)))
              (head (cl-subseq significant 0 stop))
-             (declarator (sv-parse--declarator head)))
+             (declarator (sv-parse-declarator head)))
         (when (and (plist-get declarator :name)
                    (not (eq (plist-get declarator :token) (car head))))
           (plist-get declarator :token))))))

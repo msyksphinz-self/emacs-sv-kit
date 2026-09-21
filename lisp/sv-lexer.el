@@ -92,8 +92,11 @@ COL is 0-based."
   '("<<<=" ">>>=" "===" "!==" "==?" "!=?" "<->" "<<=" ">>=" "**=" "|->" "|=>"
     "<<<" ">>>" "->>" "==" "!=" "<=" ">=" "&&" "||" "**" "->" "+=" "-=" "*="
     "/=" "%=" "&=" "|=" "^=" "<<" ">>" "::" "++" "--" "~&" "~|" "~^" "^~"
-    "+:" "-:" "=>" ".*" "'{")
-  "Operators longer than one character, longest-match first.")
+    "+:" "-:" "=>" ".*")
+  "Operators longer than one character, longest-match first.
+Note that the assignment pattern `\='{...}\=' is deliberately absent: lexing
+it as one token would hide its opening brace from everything that counts
+brackets, while its closing brace stayed visible.")
 
 (defconst sv-lexer--operator-regexp
   (concat (regexp-opt sv-lexer--multi-char-operators)

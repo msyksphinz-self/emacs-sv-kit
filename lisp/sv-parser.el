@@ -114,6 +114,39 @@ Includes both delimiters.  Returns nil when not sitting on an opener."
           (when (<= depth 0) (setq done t))))
       (nreverse acc))))
 
+(defconst sv-parse--line-directives
+  '("`ifdef" "`ifndef" "`elsif" "`undef" "`include" "`timescale" "`line"
+    "`default_nettype" "`pragma" "`begin_keywords" "`end_keywords"
+    "`unconnected_drive" "`nounconnected_drive")
+  "Directives whose arguments run to the end of their line.")
+
+(defun sv-parse--skip-directive ()
+  "Consume a compiler directive together with whatever belongs to it.
+The preprocessor directives take their arguments to the end of the line,
+and a macro used as a statement -- `SOME_MACRO(a, b)\=' -- carries its
+argument list but no semicolon.  Left unconsumed, either would be read as
+the start of the next statement and swallow it."
+  (let* ((token (sv-parse--tok))
+         (line (and token (sv-token-line token))))
+    (sv-parse--adv)
+    (if (member (and token (sv-token-text token)) sv-parse--line-directives)
+        (while (and (not (sv-parse--eob-p))
+                    (= (sv-token-line (sv-parse--tok)) line))
+          (sv-parse--adv))
+      (when (sv-parse--at "(") (sv-parse--skip-balanced))
+      (sv-parse--accept ";")))
+  nil)
+
+(defmacro sv-parse--gather (into parser)
+  "Call PARSER, pushing its node onto INTO, and guarantee progress.
+A parser that consumes tokens but produces no node -- a compiler
+directive, say -- must not make the caller skip the token after it; only
+a parser that consumed nothing gets stepped over."
+  `(let* ((before sv-parse--pos)
+          (node ,parser))
+     (cond (node (push node ,into))
+           ((= sv-parse--pos before) (sv-parse--adv)))))
+
 (defun sv-parse--skip-statement ()
   "Skip an unrecognized construct up to and including its closing `;'."
   (sv-parse--collect-until '(";"))
@@ -122,14 +155,14 @@ Includes both delimiters.  Returns nil when not sitting on an opener."
 
 ;;;; Token-list utilities
 
-(defun sv-parse-split-commas (tokens)
-  "Split TOKENS on commas that sit outside any bracket.
+(defun sv-parse-split-on (tokens separator)
+  "Split TOKENS on every SEPARATOR that sits outside any bracket.
 Return a list of token lists; empty groups are dropped."
   (let ((depth 0) (groups '()) (current '()))
     (dolist (tok tokens)
       (let ((text (sv-token-text tok)))
         (cond
-         ((and (= depth 0) (equal text ","))
+         ((and (= depth 0) (equal text separator))
           (push (nreverse current) groups)
           (setq current '()))
          (t
@@ -138,6 +171,39 @@ Return a list of token lists; empty groups are dropped."
           (push tok current)))))
     (push (nreverse current) groups)
     (cl-remove-if #'null (nreverse groups))))
+
+(defun sv-parse-split-commas (tokens)
+  "Split TOKENS on commas that sit outside any bracket."
+  (sv-parse-split-on tokens ","))
+
+(defun sv-parse-braced-body (tokens)
+  "Return the tokens inside the first `{\=' of TOKENS, without the braces."
+  (let ((depth 0) (body '()) (started nil) (done nil))
+    (dolist (tok tokens)
+      (unless done
+        (let ((text (sv-token-text tok)))
+          (cond
+           ((member text '("{" "[" "("))
+            (setq depth (1+ depth))
+            (if (and (not started) (equal text "{"))
+                (setq started t)
+              (when started (push tok body))))
+           ((member text '("}" "]" ")"))
+            (setq depth (1- depth))
+            (cond ((and started (= depth 0)) (setq done t))
+                  (started (push tok body))))
+           (started (push tok body))))))
+    (nreverse body)))
+
+(defun sv-parse--struct-members (tokens)
+  "Return the members declared by the struct or union in TOKENS."
+  (when (sv-parse-find-top tokens '("struct" "union"))
+    (let ((members '()))
+      (dolist (group (sv-parse-split-on (sv-parse-braced-body tokens) ";"))
+        (let ((declarator (sv-parse-declarator group)))
+          (when (plist-get declarator :name)
+            (push declarator members))))
+      (nreverse members))))
 
 (defun sv-parse-find-top (tokens texts)
   "Return the position in TOKENS of the first token in TEXTS at bracket depth 0."
@@ -185,7 +251,7 @@ so `[WIDTH-1: 0]\=' comes back unchanged."
 
 ;;;; Declarations and ports
 
-(defconst sv-parse--direction-keywords '("input" "output" "inout" "ref")
+(defconst sv-parse-direction-keywords '("input" "output" "inout" "ref")
   "Port direction keywords.")
 
 (defconst sv-parse--qualifier-keywords
@@ -193,7 +259,7 @@ so `[WIDTH-1: 0]\=' comes back unchanged."
     "interface" "rand" "randc" "local" "protected")
   "Keywords that may decorate a declaration without being its data type.")
 
-(defun sv-parse--declarator (tokens &optional dir)
+(defun sv-parse-declarator (tokens &optional dir)
   "Turn TOKENS describing one declarator into a plist, with direction DIR.
 TOKENS covers a single comma-separated element such as
 `input logic [7:0] i_data\=' or `mem [0:3] = \='{default:0}\='.  The declared
@@ -205,7 +271,7 @@ before it are packed dimensions and those after it unpacked ones."
          (direction dir)
          (explicit nil)
          (name-tok nil))
-    (when (and head (member (sv-token-text (car head)) sv-parse--direction-keywords))
+    (when (and head (member (sv-token-text (car head)) sv-parse-direction-keywords))
       (setq direction (intern (sv-token-text (car head))))
       (setq head (cdr head)))
     (if (and head (equal (sv-token-text (car head)) "."))
@@ -245,7 +311,7 @@ Directions and types are inherited from the previous port when omitted,
 as the ANSI header rules require."
   (let ((dir nil) (datatype nil) (ports '()))
     (dolist (group (sv-parse-split-commas tokens))
-      (let* ((port (sv-parse--declarator group))
+      (let* ((port (sv-parse-declarator group))
              (interface (and (null (plist-get port :dir))
                              (string-match-p "\\." (or (plist-get port :datatype) "")))))
         (when interface (setq port (plist-put port :interface t)))
@@ -270,7 +336,7 @@ as the ANSI header rules require."
           (setq kind (intern (sv-token-text (car group))))
           (setq group (cdr group)))
         (when group
-          (let ((decl (sv-parse--declarator group)))
+          (let ((decl (sv-parse-declarator group)))
             (when (plist-get decl :name)
               (push (append (list :kind kind) decl) params))))))
     (nreverse params)))
@@ -336,6 +402,8 @@ as the ANSI header rules require."
 
      ((sv-parse--accept ";") (list :type 'null :line line))
 
+     ((eq (sv-parse--type) 'directive) (sv-parse--skip-directive))
+
      ((sv-parse--at-any '("unique" "unique0" "priority"))
       (let ((qualifier (intern (sv-parse--text))))
         (sv-parse--adv)
@@ -352,8 +420,7 @@ as the ANSI header rules require."
         (while (and (not (sv-parse--eob-p))
                     (not (sv-parse--at "end"))
                     (not (sv-parse--at-any sv-parse--hard-stops)))
-          (let ((item (sv-parse--block-item)))
-            (if item (push item stmts) (sv-parse--adv))))
+          (sv-parse--gather stmts (sv-parse--block-item)))
         (sv-parse--accept "end")
         (when (sv-parse--accept ":") (sv-parse--adv))
         (list :type 'block :label label :stmts (nreverse stmts)
@@ -418,8 +485,7 @@ as the ANSI header rules require."
         (while (and (not (sv-parse--eob-p))
                     (not (sv-parse--at-any '("join" "join_any" "join_none")))
                     (not (sv-parse--at-any sv-parse--hard-stops)))
-          (let ((item (sv-parse--block-item)))
-            (if item (push item stmts) (sv-parse--adv))))
+          (sv-parse--gather stmts (sv-parse--block-item)))
         (sv-parse--adv)
         (list :type 'fork :stmts (nreverse stmts)
               :line line :beg beg :end sv-parse--pos)))
@@ -495,6 +561,7 @@ Handles plain targets, bit selects and concatenations."
                 :name (and name (sv-token-text name))
                 :text (sv-parse-token-string tokens)
                 :enum-members (sv-parse--enum-members tokens)
+                :members (sv-parse--struct-members tokens)
                 :line line :beg beg :end sv-parse--pos))))
 
      ((member first '("parameter" "localparam"))
@@ -523,18 +590,20 @@ Handles plain targets, bit selects and concatenations."
       (let* ((tokens (sv-parse--collect-until '(";")))
              (groups (sv-parse-split-commas tokens))
              (head (car groups))
-             (base (sv-parse--declarator (or head '())))
+             (base (sv-parse-declarator (or head '())))
              (names '()))
         (sv-parse--accept ";")
         (when (plist-get base :name) (push base names))
         ;; Later declarators inherit the data type of the first one.
         (dolist (group (cdr groups))
-          (let ((decl (sv-parse--declarator group)))
+          (let ((decl (sv-parse-declarator group)))
             (unless (and (plist-get decl :datatype)
                          (not (string-empty-p (plist-get decl :datatype))))
               (setq decl (plist-put decl :datatype (plist-get base :datatype))))
             (when (plist-get decl :name) (push decl names))))
         (list :type 'decl
+              :enum-members (sv-parse--enum-members tokens)
+              :members (sv-parse--struct-members tokens)
               :datatype (plist-get base :datatype)
               :nettype (car (cl-intersection
                              sv-lexer-net-types
@@ -544,7 +613,11 @@ Handles plain targets, bit selects and concatenations."
               :line line :beg beg :end sv-parse--pos))))))
 
 (defun sv-parse--enum-members (tokens)
-  "Return the enumeration literal names declared inside TOKENS."
+  "Return the enumeration literal names declared inside TOKENS.
+A struct body is braced the same way but names members, not literals, so
+TOKENS must actually introduce an enumeration."
+  (unless (sv-parse-find-top tokens '("enum"))
+    (setq tokens nil))
   (let ((members '()) (expect nil) (depth 0))
     (dolist (tok tokens)
       (let ((text (sv-token-text tok)))
@@ -675,8 +748,7 @@ Handles plain targets, bit selects and concatenations."
       (while (and (not (sv-parse--eob-p))
                   (not (sv-parse--at end-keyword))
                   (not (sv-parse--at-any (remove end-keyword sv-parse--hard-stops))))
-        (let ((item (sv-parse--block-item)))
-          (if item (push item body) (sv-parse--adv))))
+        (sv-parse--gather body (sv-parse--block-item)))
       (sv-parse--accept end-keyword)
       (when (sv-parse--accept ":") (sv-parse--adv))
       (list :type kind :name name :args args :prototype nil
@@ -692,7 +764,7 @@ Handles plain targets, bit selects and concatenations."
 
      ((sv-parse--accept ";") (list :type 'null :line line))
 
-     ((eq (sv-parse--type) 'directive) (sv-parse--adv) nil)
+     ((eq (sv-parse--type) 'directive) (sv-parse--skip-directive))
 
      ((equal text "assign")
       (sv-parse--adv)
@@ -734,8 +806,7 @@ Handles plain targets, bit selects and concatenations."
         (while (and (not (sv-parse--eob-p))
                     (not (sv-parse--at "endgenerate"))
                     (not (sv-parse--at-any (remove "endgenerate" sv-parse--hard-stops))))
-          (let ((item (sv-parse--module-item)))
-            (if item (push item items) (sv-parse--adv))))
+          (sv-parse--gather items (sv-parse--module-item)))
         (sv-parse--accept "endgenerate")
         (list :type 'generate :items (nreverse items)
               :line line :beg beg :end sv-parse--pos)))
@@ -827,8 +898,7 @@ Handles plain targets, bit selects and concatenations."
         (while (and (not (sv-parse--eob-p))
                     (not (sv-parse--at "end"))
                     (not (sv-parse--at-any sv-parse--hard-stops)))
-          (let ((item (sv-parse--module-item)))
-            (if item (push item items) (sv-parse--adv))))
+          (sv-parse--gather items (sv-parse--module-item)))
         (sv-parse--accept "end")
         (when (sv-parse--accept ":") (sv-parse--adv))
         (list :type 'generate-block :label label :items (nreverse items)
@@ -864,8 +934,7 @@ Handles plain targets, bit selects and concatenations."
     (sv-parse--collect-until '(";"))
     (sv-parse--accept ";")
     (while (and (not (sv-parse--eob-p)) (not (sv-parse--at end-keyword)))
-      (let ((item (sv-parse--module-item)))
-        (if item (push item items) (sv-parse--adv))))
+      (sv-parse--gather items (sv-parse--module-item)))
     (sv-parse--accept end-keyword)
     (when (sv-parse--accept ":")
       (setq end-label (sv-parse--text))
@@ -933,27 +1002,49 @@ holding the design units together with the token stream they came from."
 (defvar sv-parse--declarations nil
   "Accumulator used while walking a node for the names it declares.")
 
+(defvar sv-parse--scope 0
+  "Identifier of the declaration scope being walked.")
+
+(defvar sv-parse--scope-counter 0
+  "Source of fresh scope identifiers.")
+
+(defmacro sv-parse--in-new-scope (&rest body)
+  "Run BODY with a fresh declaration scope.
+Each block, generate branch and subprogram is a scope of its own, so the
+same name may be declared in two of them without clashing."
+  (declare (indent 0) (debug t))
+  `(let ((sv-parse--scope (cl-incf sv-parse--scope-counter)))
+     ,@body))
+
 (defun sv-parse--record-declaration (name kind line token &optional extra)
   "Push a declaration record built from NAME, KIND, LINE, TOKEN and EXTRA."
   (when (and name (stringp name))
-    (push (append (list :name name :kind kind :line line :token token) extra)
+    (push (append (list :name name :kind kind :line line :token token
+                        :scope sv-parse--scope)
+                  extra)
           sv-parse--declarations)))
 
 (defun sv-parse-header-names (tokens)
-  "Return identifiers declared by a loop header TOKENS such as `for (int i...)'."
-  (let ((names '()) (previous nil) (bracket-depth 0) (foreach nil))
+  "Return identifiers declared by a loop header TOKENS.
+Handles `for (int unsigned i = 0; ...)\=' as well as `foreach (a[i, j])\='."
+  (let ((names '()) (typed nil) (bracket-depth 0) (foreach nil))
     (dolist (tok tokens)
       (let ((text (sv-token-text tok)))
         (cond
-         ((equal text "[") (setq bracket-depth (1+ bracket-depth) foreach t))
+         ((equal text "[")
+          (setq bracket-depth (1+ bracket-depth))
+          (setq foreach t))
          ((equal text "]") (setq bracket-depth (max 0 (1- bracket-depth))))
+         ((or (member text sv-lexer-data-types)
+              (member text '("genvar" "var")))
+          (setq typed t))
+         ;; A sign qualifier sits between the type and the name.
+         ((member text '("signed" "unsigned")) nil)
          ((and (eq (sv-token-type tok) 'ident)
-               (or (and previous
-                        (or (member (sv-token-text previous) sv-lexer-data-types)
-                            (member (sv-token-text previous) '("genvar" "var"))))
-                   (and foreach (> bracket-depth 0))))
-          (push (cons (sv-token-text tok) tok) names)))
-        (setq previous tok)))
+               (or typed (and foreach (> bracket-depth 0))))
+          (push (cons text tok) names)
+          (setq typed nil))
+         ((member text '(";" "=")) (setq typed nil)))))
     (nreverse names)))
 
 (defun sv-parse--scan-declarations (node)
@@ -962,6 +1053,9 @@ holding the design units together with the token stream they came from."
     (let ((type (plist-get node :type)))
       (cl-case type
         (decl
+         (dolist (member (plist-get node :enum-members))
+           (sv-parse--record-declaration (plist-get member :name) 'enum
+                                         (plist-get member :line) nil))
          (dolist (name (plist-get node :names))
            (sv-parse--record-declaration (plist-get name :name)
                                  (if (plist-get node :nettype) 'net 'var)
@@ -988,10 +1082,12 @@ holding the design units together with the token stream they came from."
          (sv-parse--record-declaration (plist-get node :name) type
                                        (plist-get node :line) nil
                                        (list :node node))
-         (dolist (arg (plist-get node :args))
-           (sv-parse--record-declaration (plist-get arg :name) 'arg
-                                 (plist-get arg :line) (plist-get arg :token)))
-         (mapc #'sv-parse--scan-declarations (plist-get node :body)))
+         (sv-parse--in-new-scope
+           (dolist (arg (plist-get node :args))
+             (sv-parse--record-declaration (plist-get arg :name) 'arg
+                                           (plist-get arg :line)
+                                           (plist-get arg :token)))
+           (mapc #'sv-parse--scan-declarations (plist-get node :body))))
         (instance
          (dolist (sibling (plist-get node :siblings))
            (sv-parse--record-declaration (plist-get sibling :name) 'instance
@@ -1000,23 +1096,29 @@ holding the design units together with the token stream they came from."
                                                :module (plist-get node :module)))))
         ((generate generate-block)
          (sv-parse--record-declaration (plist-get node :label) 'label
-                               (plist-get node :line) nil)
-         (mapc #'sv-parse--scan-declarations (plist-get node :items)))
+                                       (plist-get node :line) nil)
+         (sv-parse--in-new-scope
+           (mapc #'sv-parse--scan-declarations (plist-get node :items))))
         (generate-for
-         (dolist (pair (sv-parse-header-names (plist-get node :header)))
-           (sv-parse--record-declaration (car pair) 'genvar
-                                 (sv-token-line (cdr pair)) (cdr pair)))
-         (sv-parse--scan-declarations (plist-get node :body)))
+         (sv-parse--in-new-scope
+           (dolist (pair (sv-parse-header-names (plist-get node :header)))
+             (sv-parse--record-declaration (car pair) 'genvar
+                                           (sv-token-line (cdr pair)) (cdr pair)))
+           (sv-parse--scan-declarations (plist-get node :body))))
         (generate-if
-         (sv-parse--scan-declarations (plist-get node :then))
-         (sv-parse--scan-declarations (plist-get node :else)))
+         (sv-parse--in-new-scope
+           (sv-parse--scan-declarations (plist-get node :then)))
+         (sv-parse--in-new-scope
+           (sv-parse--scan-declarations (plist-get node :else))))
         (generate-case
          (mapc #'sv-parse--scan-declarations (plist-get node :items)))
         (block
          (sv-parse--record-declaration (plist-get node :label) 'label
-                               (plist-get node :line) nil)
-         (mapc #'sv-parse--scan-declarations (plist-get node :stmts)))
-        (fork (mapc #'sv-parse--scan-declarations (plist-get node :stmts)))
+                                       (plist-get node :line) nil)
+         (sv-parse--in-new-scope
+           (mapc #'sv-parse--scan-declarations (plist-get node :stmts))))
+        (fork (sv-parse--in-new-scope
+                (mapc #'sv-parse--scan-declarations (plist-get node :stmts))))
         ((always initial final)
          (sv-parse--scan-declarations (plist-get node :body)))
         (if
@@ -1026,10 +1128,11 @@ holding the design units together with the token stream they came from."
          (dolist (item (plist-get node :items))
            (sv-parse--scan-declarations (plist-get item :stmt))))
         (loop
-         (dolist (pair (sv-parse-header-names (plist-get node :header)))
-           (sv-parse--record-declaration (car pair) 'loopvar
-                                 (sv-token-line (cdr pair)) (cdr pair)))
-         (sv-parse--scan-declarations (plist-get node :body)))
+         (sv-parse--in-new-scope
+           (dolist (pair (sv-parse-header-names (plist-get node :header)))
+             (sv-parse--record-declaration (car pair) 'loopvar
+                                           (sv-token-line (cdr pair)) (cdr pair)))
+           (sv-parse--scan-declarations (plist-get node :body))))
         (t nil)))))
 
 (defun sv-parse--unit-declarations (unit)
@@ -1087,11 +1190,13 @@ holding the design units together with the token stream they came from."
 Each record carries at least `:name\=', `:kind\=', `:line\=' and `:token\='.
 For a design unit the list starts with its parameters and ports; for any
 other node it holds whatever that subtree declares."
-  (if (memq (plist-get node :type) '(module interface package program class))
-      (sv-parse--unit-declarations node)
-    (let ((sv-parse--declarations '()))
-      (sv-parse--scan-declarations node)
-      (nreverse sv-parse--declarations))))
+  (let ((sv-parse--scope 0)
+        (sv-parse--scope-counter 0))
+    (if (memq (plist-get node :type) '(module interface package program class))
+        (sv-parse--unit-declarations node)
+      (let ((sv-parse--declarations '()))
+        (sv-parse--scan-declarations node)
+        (nreverse sv-parse--declarations)))))
 
 (defun sv-parse-declared-names (node)
   "Return the names NODE declares, as a list of strings."

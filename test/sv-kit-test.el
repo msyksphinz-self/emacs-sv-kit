@@ -57,7 +57,20 @@
 (ert-deftest sv-lexer-reads-number-literals ()
   (should (equal (sv-test-texts "8'hFF 'b1010 32'd12_3 1.5e-3 10ns 'x")
                  '("8'hFF" "'b1010" "32'd12_3" "1.5e-3" "10ns" "'x")))
-  (should (equal (sv-test-texts "a'{1}") '("a" "'{" "1" "}"))))
+  ;; The brace of an assignment pattern is a brace like any other, so that
+  ;; everything which counts brackets stays balanced.
+  (should (equal (sv-test-texts "a'{1}") '("a" "'" "{" "1" "}"))))
+
+(ert-deftest sv-parser-keeps-assignment-patterns-balanced ()
+  (let ((unit (sv-test-unit "module m;
+                               for (genvar i = 0; i < 2; i++) begin : g
+                                 `FF(q[i], d, '{default: '0}, clk)
+                               end
+                               assign x = 1;
+                             endmodule")))
+    (should (equal (mapcar (lambda (item) (plist-get item :type))
+                           (plist-get unit :items))
+                   '(generate-for continuous-assign)))))
 
 (ert-deftest sv-lexer-keeps-comments-and-strings-whole ()
   (let ((tokens (sv-lex-string "a /* one\ntwo */ b // trailing\nc")))
@@ -196,6 +209,72 @@
                               endmodule"))
          (assign (plist-get (car (plist-get unit :items)) :body)))
     (should (equal (plist-get assign :lhs-targets) '("a" "b")))))
+
+(ert-deftest sv-parser-keeps-module-boundaries-across-directives ()
+  ;; A directive right before `endmodule' used to make the parser step over
+  ;; the end keyword and swallow whatever module came next.
+  (let ((tree (sv-parse-string "module a;\n`ifndef SYN\n  initial $display(\"x\");\n`endif\nendmodule\nmodule b;\nendmodule")))
+    (should (equal (mapcar (lambda (unit) (plist-get unit :name))
+                           (plist-get tree :units))
+                   '("a" "b")))))
+
+(ert-deftest sv-parser-consumes-directive-arguments ()
+  (let ((unit (sv-test-unit "module m;\n`ifndef SYN\n  if (D < 2) begin : g\n    initial $fatal(1, \"x\");\n  end\n`endif\n  assign x = 1;\nendmodule")))
+    (should (equal (mapcar (lambda (item) (plist-get item :type))
+                           (plist-get unit :items))
+                   '(generate-if continuous-assign)))))
+
+(ert-deftest sv-parser-does-not-let-a-macro-swallow-the-next-statement ()
+  (let* ((unit (sv-test-unit "module m;
+                                always_comb begin
+                                  if (a) begin
+                                    `SET_STRUCT(o.b, i[k].b)
+                                  end else begin
+                                    o.b = '0;
+                                  end
+                                end
+                              endmodule"))
+         (branch (car (plist-get (plist-get (car (plist-get unit :items)) :body) :stmts))))
+    (should (eq (plist-get branch :type) 'if))
+    (should (plist-get branch :else))
+    (should (equal (plist-get (car (plist-get (plist-get branch :else) :stmts))
+                              :lhs-targets)
+                   '("o")))))
+
+(ert-deftest sv-parser-scopes-declarations-per-block ()
+  (let* ((unit (sv-test-unit "module m;
+                                if (X) begin : a
+                                  localparam P = 1;
+                                end else begin : b
+                                  localparam P = 2;
+                                end
+                              endmodule"))
+         (scopes (mapcar (lambda (record) (plist-get record :scope))
+                         (cl-remove-if-not
+                          (lambda (record) (equal (plist-get record :name) "P"))
+                          (sv-parse-declarations unit)))))
+    (should (= (length scopes) 2))
+    (should (/= (nth 0 scopes) (nth 1 scopes)))))
+
+(ert-deftest sv-parser-reads-anonymous-enums-and-structs ()
+  (let* ((unit (sv-test-unit "module m;
+                                enum logic [1:0] {IDLE, RUN} state;
+                                struct packed { logic v; logic [7:0] d; } entry;
+                              endmodule"))
+         (declaration (car (plist-get unit :items))))
+    (should (equal (mapcar (lambda (member) (plist-get member :name))
+                           (plist-get declaration :enum-members))
+                   '("IDLE" "RUN")))
+    (should (member "IDLE" (sv-parse-declared-names unit)))
+    (should (equal (mapcar (lambda (member) (plist-get member :name))
+                           (plist-get (nth 1 (plist-get unit :items)) :members))
+                   '("v" "d")))))
+
+(ert-deftest sv-parser-finds-a-typed-loop-variable ()
+  (let ((names (sv-parse-header-names
+                (cl-remove-if #'sv-token-trivia-p
+                              (sv-lex-string "(int unsigned j = 0; j < 3; j++)")))))
+    (should (equal (mapcar #'car names) '("j")))))
 
 (ert-deftest sv-parser-survives-a-syntax-error ()
   (let ((tree (sv-parse-string "module m; logic ((( ; endmodule module n; endmodule")))
@@ -347,6 +426,52 @@
    (memq 'undriven-output
          (sv-test-rules "module test (input logic i_a, output logic o_q);
                            sub u_sub (.a (i_a), .q (o_q));
+                         endmodule"))))
+
+(ert-deftest sv-lint-accepts-the-same-name-in-two-scopes ()
+  (should-not
+   (memq 'duplicate-declaration
+         (sv-test-rules "module test (output logic o_q);
+                           if (X) begin : a
+                             localparam P = 1;
+                             assign o_q = P;
+                           end else begin : b
+                             localparam P = 2;
+                             assign o_q = P;
+                           end
+                         endmodule"))))
+
+(ert-deftest sv-lint-accepts-the-same-name-in-two-ifdef-branches ()
+  (should-not
+   (memq 'duplicate-declaration
+         (sv-test-rules "module test (output logic o_q);
+                         `ifdef WIDE
+                           typedef logic [7:0] word_t;
+                         `else
+                           typedef logic [3:0] word_t;
+                         `endif
+                           word_t w;
+                           assign o_q = |w;
+                         endmodule"))))
+
+(ert-deftest sv-lint-ignores-struct-members-and-labels ()
+  (let ((rules (sv-test-rules "module test (output logic o_q);
+                                 typedef struct packed {
+                                   logic       id;
+                                   logic [7:0] len;
+                                 } entry_t;
+                                 entry_t e;
+                                 assign o_q = e.id;
+                                 check_it : assert final (o_q == 1'b1);
+                               endmodule")))
+    (should-not (memq 'undeclared-identifier rules))))
+
+(ert-deftest sv-lint-counts-a-macro-argument-as-a-driver ()
+  (should-not
+   (memq 'undriven-output
+         (sv-test-rules "module test (input logic i_clk, input logic i_d,
+                                      output logic o_q);
+                           `FFLARN(o_q, i_d, 1'b1, '0, i_clk, 1'b1)
                          endmodule"))))
 
 (ert-deftest sv-lint-finds-duplicate-declarations ()

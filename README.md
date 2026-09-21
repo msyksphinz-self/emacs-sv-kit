@@ -256,9 +256,31 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 89 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 100 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして
 局所的に劣化するだけなので、マクロ多用のコードや書きかけのファイルでも
 リンタ・フォーマッタは動き続けます。
+
+## 検証
+
+実世界の SystemVerilog で継続的に検証しています。PULP の
+[axi](https://github.com/pulp-platform/axi) と
+[common_cells](https://github.com/pulp-platform/common_cells)
+の **225 ファイル・314 design unit**（interface / package / 構造体 / アサーション /
+`` `ifdef `` / マクロを多用するコード）に対して:
+
+- パースエラー **0 件**
+- フォーマッタはトークン列を 1 つも変えず（意味不変）、冪等性も **全ファイルで成立**
+- lint の指摘は 1939 → 992 件まで精査。`duplicate-declaration` の誤検知は
+  スコープ／`` `ifdef `` 分岐を考慮して **0 件** になりました
+
+この検証で見つかったパーサの不具合（`` `endif `` 直後の `endmodule` の取りこぼし、
+代入パターン `'{...}` の括弧不整合、マクロ文が次の文を飲み込む問題など）は
+すべて修正し、回帰テストを追加してあります。
+
+```console
+$ git submodule update --init --depth 1   # 検証用コーパスを取得
+$ ./bin/sv-kit lint $(find vendor -name '*.sv')
+```

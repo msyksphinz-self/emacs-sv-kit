@@ -39,7 +39,7 @@
 
 (cl-defstruct (sv-lint-context (:constructor sv-lint-context-create) (:copier nil))
   "State shared by every rule during one lint run."
-  file text lines tree tokens significant modules
+  file text lines tree tokens significant modules conditionals
   suppress-file suppress-line suppress-ranges diagnostics)
 
 (defconst sv-lint-rule-alist
@@ -73,7 +73,7 @@
   "Every rule: its identifier, default severity and one-line description.")
 
 (defcustom sv-lint-disabled-rules
-  '(port-naming legacy-net-type)
+  '(port-naming legacy-net-type unconnected-port)
   "Rules that are not run at all.
 Every identifier of `sv-lint-rule-alist' is accepted."
   :type '(repeat symbol)
@@ -182,6 +182,63 @@ An empty list means every rule, which is spelled t."
       (list t)
     (mapcar #'intern (split-string text "[, \t]+" t))))
 
+(defun sv-lint--scan-conditionals (ctx)
+  "Record, for each line of CTX, which `\=`ifdef\=' branches are active on it.
+Two declarations in different branches of the same conditional never
+reach the compiler together, so they must not be reported as clashing."
+  (let ((table (make-hash-table :test #'eq))
+        (stack '())
+        (counter 0))
+    (dolist (token (sv-lint-context-tokens ctx))
+      (when (eq (sv-token-type token) 'directive)
+        (let ((text (sv-token-text token)))
+          (cond
+           ((member text '("`ifdef" "`ifndef"))
+            (push (cons (cl-incf counter) 0) stack))
+           ((member text '("`else" "`elsif"))
+            (when stack (setcdr (car stack) (1+ (cdar stack)))))
+           ((equal text "`endif") (pop stack)))))
+      (unless (sv-token-trivia-p token)
+        (puthash (sv-token-line token) (copy-alist stack) table)))
+    (setf (sv-lint-context-conditionals ctx) table)))
+
+(defun sv-lint--exclusive-p (ctx line-a line-b)
+  "Return non-nil when LINE-A and LINE-B of CTX cannot both be compiled."
+  (let ((path-a (gethash line-a (sv-lint-context-conditionals ctx)))
+        (path-b (gethash line-b (sv-lint-context-conditionals ctx))))
+    (cl-some (lambda (entry)
+               (let ((other (assq (car entry) path-b)))
+                 (and other (/= (cdr entry) (cdr other)))))
+             path-a)))
+
+(defun sv-lint--macro-argument-names (ctx unit)
+  "Return the identifiers UNIT passes to macros.
+A macro may well assign to what it is handed -- `\=`FF(q, d, clk)\=' does --
+so those names must count as driven."
+  (let* ((vec (sv-lint-context-significant ctx))
+         (limit (length vec))
+         (beg (or (plist-get unit :beg) 0))
+         (end (min (or (plist-get unit :end) limit) limit))
+         (names '())
+         (i beg))
+    (while (< i end)
+      (if (and (eq (sv-token-type (aref vec i)) 'directive)
+               (< (1+ i) end)
+               (equal (sv-token-text (aref vec (1+ i))) "("))
+          (let ((depth 0) (done nil))
+            (setq i (1+ i))
+            (while (and (< i end) (not done))
+              (let ((text (sv-token-text (aref vec i))))
+                (cond ((member text '("(" "[" "{")) (setq depth (1+ depth)))
+                      ((member text '(")" "]" "}"))
+                       (setq depth (1- depth))
+                       (when (<= depth 0) (setq done t)))
+                      ((eq (sv-token-type (aref vec i)) 'ident)
+                       (push text names))))
+              (setq i (1+ i))))
+        (setq i (1+ i))))
+    (delete-dups names)))
+
 (defun sv-lint--scan-suppressions (ctx)
   "Populate the suppression tables of CTX from its comment tokens."
   (let ((line-table (make-hash-table :test #'eq))
@@ -240,6 +297,13 @@ Covers declared names themselves and the module name of each instance."
       (when (plist-get decl :token) (puthash (plist-get decl :token) t table)))
     (dolist (instance (sv-parse-collect unit 'instance))
       (puthash (plist-get instance :beg) t table))
+    ;; The members of a struct are declarations, not uses of a signal that
+    ;; happens to share their name.
+    (dolist (type '(typedef decl))
+      (dolist (node (sv-parse-collect unit type))
+        (dolist (member (plist-get node :members))
+          (when (plist-get member :token)
+            (puthash (plist-get member :token) t table)))))
     ;; `modport m (...)' and friends name a scope, not a signal.
     (dolist (node (sv-parse-collect unit 'other))
       (when (plist-get node :beg)
@@ -261,6 +325,9 @@ IGNORED holds declaration tokens, plus the token index of instance types."
                (not (gethash tok ignored))
                (not (gethash i ignored))
                (let ((prev (and (> i beg) (aref vec (1- i)))))
+                 ;; `\=`ifdef VERILATOR\=' names a macro, not a signal.
+                 (not (and prev (eq (sv-token-type prev) 'directive))))
+               (let ((prev (and (> i beg) (aref vec (1- i)))))
                  (not (and prev (member (sv-token-text prev)
                                         '("." "::" "module" "macromodule"
                                           "interface" "package" "program"
@@ -269,7 +336,19 @@ IGNORED holds declaration tokens, plus the token index of instance types."
                                           "endpackage" "endprogram" "endclass"
                                           "endfunction" "endtask")))))
                (let ((next (and (< (1+ i) end) (aref vec (1+ i)))))
-                 (not (and next (equal (sv-token-text next) "::")))))
+                 (not (and next (equal (sv-token-text next) "::"))))
+               ;; `check_id : assert ...' labels the statement.
+               (not (and (< (+ i 2) end)
+                         (equal (sv-token-text (aref vec (1+ i))) ":")
+                         (member (sv-token-text (aref vec (+ i 2)))
+                                 '("assert" "assume" "cover" "restrict" "expect"
+                                   "property" "sequence" "always" "always_comb"
+                                   "always_ff" "always_latch" "initial" "final"))))
+               ;; `\='{id: x, len: y}' names members, it does not read them.
+               (not (and (> i beg)
+                         (member (sv-token-text (aref vec (1- i))) '("'{" "{" ","))
+                         (< (1+ i) end)
+                         (equal (sv-token-text (aref vec (1+ i))) ":"))))
      do (push (cons (sv-token-text tok) tok) refs))
     (nreverse refs)))
 
@@ -388,7 +467,11 @@ Writing to a signal is not using it, so these occurrences must not keep
                                        (or (plist-get stmt :target) "signal")))))
           (let* ((assigned (sv-parse-assigned-names body))
                  (guaranteed (sv-lint--must-assign body))
-                 (latched (cl-set-difference assigned guaranteed :test #'equal)))
+                 (partial (mapcar #'car (cl-remove-if-not
+                                         #'cdr (sv-lint--driver-targets body))))
+                 (latched (cl-set-difference
+                           (cl-set-difference assigned guaranteed :test #'equal)
+                           partial :test #'equal)))
             (dolist (name (sort latched #'string<))
               (unless (member name local)
                 (sv-lint--report ctx 'implicit-latch (plist-get node :line) nil
@@ -446,16 +529,22 @@ Writing to a signal is not using it, so these occurrences must not keep
                                   (sv-lint-context-tokens ctx)))))
     ;; Duplicate declarations, ignoring the ones a generate block legitimately
     ;; repeats in separate scopes.
-    (dolist (decl declarations)
-      (let* ((name (plist-get decl :name))
-             (previous (gethash name declared)))
-        (if (and previous
-                 (not (memq (plist-get decl :kind) '(label genvar loopvar arg)))
-                 (not (memq (plist-get previous :kind) '(label genvar loopvar arg))))
+    (let ((in-scope (make-hash-table :test #'equal)))
+      (dolist (decl declarations)
+        (let* ((name (plist-get decl :name))
+               (key (format "%s@%s" name (plist-get decl :scope)))
+               (previous (gethash key in-scope)))
+          (when (and previous
+                     (not (memq (plist-get decl :kind) '(label genvar loopvar arg)))
+                     (not (memq (plist-get previous :kind)
+                                '(label genvar loopvar arg)))
+                     (not (sv-lint--exclusive-p ctx (plist-get decl :line)
+                                                (plist-get previous :line))))
             (sv-lint--report ctx 'duplicate-declaration (plist-get decl :line) nil
                              (format "`%s' is already declared on line %d."
-                                     name (plist-get previous :line)))
-          (puthash name decl declared))))
+                                     name (plist-get previous :line))))
+          (unless previous (puthash key decl in-scope))
+          (unless (gethash name declared) (puthash name decl declared)))))
 
     (let ((writes (sv-lint--write-tokens unit)))
       (dolist (reference references)
@@ -486,7 +575,8 @@ Writing to a signal is not using it, so these occurrences must not keep
 
     ;; Outputs need a driver: a procedural or continuous assignment, or a
     ;; connection to an instance port.
-    (let ((driven (sv-parse-assigned-names unit)))
+    (let ((driven (append (sv-lint--macro-argument-names ctx unit)
+                          (sv-parse-assigned-names unit))))
       (dolist (instance (sv-parse-collect unit 'instance))
         (dolist (sibling (plist-get instance :siblings))
           (dolist (connection (plist-get sibling :connections))
@@ -625,7 +715,10 @@ part select, which several blocks may legitimately share."
           (dolist (tok tokens)
             (let* ((name (sv-token-text tok))
                    (rest (cdr (memq tok lhs)))
-                   (partial (and rest (equal (sv-token-text (car rest)) "[")))
+                   ;; A bit select or a struct field is a partial drive:
+                   ;; different blocks may own different pieces.
+                   (partial (and rest (member (sv-token-text (car rest))
+                                              '("[" "."))))
                    (entry (assoc name targets)))
               (if entry
                   (unless partial (setcdr entry nil))
@@ -652,6 +745,11 @@ part select, which several blocks may legitimately share."
               (puthash name (cons item (gethash name drivers)) drivers))))))
     (maphash
      (lambda (name items)
+       (setq items (cl-remove-duplicates
+                    items
+                    :test (lambda (a b)
+                            (sv-lint--exclusive-p ctx (plist-get a :line)
+                                                  (plist-get b :line)))))
        (when (> (length items) 1)
          (let ((sorted (sort (mapcar (lambda (item) (plist-get item :line)) items) #'<)))
            (sv-lint--report
@@ -739,6 +837,7 @@ MODULES is an optional table of known design units, as built by
                :modules (or modules (sv-lint-module-table tree))
                :diagnostics '())))
     (sv-lint--scan-suppressions ctx)
+    (sv-lint--scan-conditionals ctx)
     (dolist (unit (plist-get tree :units))
       (when (memq (plist-get unit :type) '(module interface program))
         (sv-lint--rule-procedural ctx unit)
