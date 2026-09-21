@@ -1,0 +1,844 @@
+;;; sv-lint.el --- Linter for SystemVerilog -*- lexical-binding: t; -*-
+
+;; Author: SCARIV project
+;; SPDX-License-Identifier: Apache-2.0
+
+;;; Commentary:
+
+;; Static checks over the tree produced by `sv-parser'.  The rules are the
+;; ones that matter when writing synthesizable RTL by hand: blocking
+;; assignments in clocked blocks, latches inferred from an incomplete
+;; `always_comb', case statements without a default, signals that are
+;; declared and never used or used and never declared, outputs nobody
+;; drives, and positional instance connections.
+;;
+;; Diagnostics can be silenced from the source:
+;;
+;;   logic unused;                   // sv-lint: disable=unused-declaration
+;;   // sv-lint: disable-next-line=case-without-default
+;;   // sv-lint: disable-file=line-too-long
+;;   /* verilator lint_off CASEINCOMPLETE */  ... /* verilator lint_on ... */
+;;
+;; A bare `// sv-lint: disable' silences every rule on its line.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'subr-x)
+(require 'sv-lexer)
+(require 'sv-parser)
+
+(defgroup sv-lint nil
+  "Linting for SystemVerilog sources."
+  :group 'tools
+  :prefix "sv-lint-")
+
+(cl-defstruct (sv-diagnostic (:constructor sv-diagnostic-create) (:copier nil))
+  "One linter finding.  LINE is 1-based, COL is 0-based."
+  file line col severity rule message)
+
+(cl-defstruct (sv-lint-context (:constructor sv-lint-context-create) (:copier nil))
+  "State shared by every rule during one lint run."
+  file text lines tree tokens significant modules
+  suppress-file suppress-line suppress-ranges diagnostics)
+
+(defconst sv-lint-rule-alist
+  '((blocking-in-always-ff      error   "Blocking assignment inside always_ff.")
+    (nonblocking-in-always-comb warning "Non-blocking assignment in combinational logic.")
+    (case-without-default       warning "Case statement without a default arm.")
+    (implicit-latch             warning "Combinational block infers a latch.")
+    (prefer-always-comb         info    "Use always_comb instead of always @*.")
+    (incomplete-sensitivity     warning "Signal read but missing from the sensitivity list.")
+    (undeclared-identifier      error   "Identifier used without a declaration.")
+    (unused-declaration         warning "Declared signal is never used.")
+    (unused-parameter           warning "Declared parameter is never used.")
+    (undriven-output            warning "Output port is never driven.")
+    (duplicate-declaration      error   "Name declared more than once.")
+    (positional-port-connection warning "Instance connects ports by position.")
+    (unconnected-port           info    "Instance port is left unconnected.")
+    (instance-unknown-port      error   "Instance connects a port the module does not have.")
+    (instance-missing-port      warning "Instance leaves a module port out.")
+    (unlabeled-generate-block   info    "Generate block has no label.")
+    (module-filename-mismatch   warning "Module name differs from the file name.")
+    (legacy-net-type            info    "Prefer logic over reg/wire.")
+    (port-naming                info    "Port name does not follow the naming convention.")
+    (line-too-long              info    "Line exceeds the configured width.")
+    (trailing-whitespace        info    "Line has trailing whitespace.")
+    (tab-indentation            info    "Line is indented with tabs.")
+    (missing-final-newline      info    "File does not end with a newline."))
+  "Every rule: its identifier, default severity and one-line description.")
+
+(defcustom sv-lint-disabled-rules
+  '(port-naming legacy-net-type)
+  "Rules that are not run at all.
+Every identifier of `sv-lint-rule-alist' is accepted."
+  :type '(repeat symbol)
+  :group 'sv-lint)
+
+(defcustom sv-lint-severity-overrides nil
+  "Alist mapping a rule identifier to the severity it should report with."
+  :type '(alist :key-type symbol
+                :value-type (choice (const error) (const warning) (const info)))
+  :group 'sv-lint)
+
+(defcustom sv-lint-max-line-length 100
+  "Column beyond which `line-too-long' fires."
+  :type 'integer
+  :group 'sv-lint)
+
+(defcustom sv-lint-port-prefixes
+  '((input . "\\`i_") (output . "\\`o_") (inout . "\\`b_"))
+  "Alist mapping a port direction to the regexp its name must match.
+Only consulted when the `port-naming' rule is enabled."
+  :type '(alist :key-type symbol :value-type regexp)
+  :group 'sv-lint)
+
+(defcustom sv-lint-case-default-exempt-qualified t
+  "When non-nil, `unique' and `priority' case statements need no default arm."
+  :type 'boolean
+  :group 'sv-lint)
+
+(defcustom sv-lint-ignored-name-regexp "\\`\\(?:_\\|unused_\\)"
+  "Names matching this regexp are exempt from the unused-name rules."
+  :type 'regexp
+  :group 'sv-lint)
+
+(defcustom sv-lint-verilator-alias
+  '(("CASEINCOMPLETE" . case-without-default)
+    ("CASEX"          . case-without-default)
+    ("LATCH"          . implicit-latch)
+    ("UNUSED"         . unused-declaration)
+    ("UNUSEDSIGNAL"   . unused-declaration)
+    ("UNUSEDPARAM"    . unused-parameter)
+    ("UNDRIVEN"       . undriven-output)
+    ("DECLFILENAME"   . module-filename-mismatch)
+    ("PINCONNECTEMPTY" . unconnected-port)
+    ("PINMISSING"     . instance-missing-port)
+    ("BLKSEQ"         . blocking-in-always-ff)
+    ("COMBDLY"        . nonblocking-in-always-comb)
+    ("ALWCOMBORDER"   . incomplete-sensitivity))
+  "Mapping from a Verilator warning code to the rule it silences.
+Lets existing `/* verilator lint_off CODE */' pragmas suppress the
+equivalent finding here."
+  :type '(alist :key-type string :value-type symbol)
+  :group 'sv-lint)
+
+
+;;;; Reporting and suppression
+
+(defun sv-lint-rule-severity (rule)
+  "Return the severity RULE reports with."
+  (or (cdr (assq rule sv-lint-severity-overrides))
+      (nth 1 (assq rule sv-lint-rule-alist))
+      'warning))
+
+(defun sv-lint-rule-documentation (rule)
+  "Return the one-line description of RULE."
+  (nth 2 (assq rule sv-lint-rule-alist)))
+
+(defun sv-lint--rule-enabled-p (rule)
+  "Return non-nil when RULE should run."
+  (not (memq rule sv-lint-disabled-rules)))
+
+(defun sv-lint--suppressed-p (ctx rule line)
+  "Return non-nil when RULE is silenced on LINE of CTX."
+  (let ((file-set (sv-lint-context-suppress-file ctx))
+        (line-set (gethash line (sv-lint-context-suppress-line ctx))))
+    (or (memq t file-set)
+        (memq rule file-set)
+        (memq t line-set)
+        (memq rule line-set)
+        (cl-some (lambda (range)
+                   (and (eq (nth 0 range) rule)
+                        (>= line (nth 1 range))
+                        (<= line (nth 2 range))))
+                 (sv-lint-context-suppress-ranges ctx)))))
+
+(defun sv-lint--report (ctx rule line col message)
+  "Record a finding for RULE at LINE and COL of CTX with MESSAGE."
+  (when (and (sv-lint--rule-enabled-p rule)
+             (not (sv-lint--suppressed-p ctx rule line)))
+    (push (sv-diagnostic-create :file (sv-lint-context-file ctx)
+                                :line line :col (or col 0)
+                                :severity (sv-lint-rule-severity rule)
+                                :rule rule :message message)
+          (sv-lint-context-diagnostics ctx))))
+
+(defun sv-lint--report-token (ctx rule token message)
+  "Record a finding for RULE at TOKEN of CTX with MESSAGE."
+  (sv-lint--report ctx rule
+                   (if token (sv-token-line token) 1)
+                   (if token (sv-token-col token) 0)
+                   message))
+
+(defun sv-lint--parse-rule-names (text)
+  "Turn the comma-separated rule list TEXT into a list of symbols.
+An empty list means every rule, which is spelled t."
+  (if (or (null text) (string-empty-p (string-trim text)))
+      (list t)
+    (mapcar #'intern (split-string text "[, \t]+" t))))
+
+(defun sv-lint--scan-suppressions (ctx)
+  "Populate the suppression tables of CTX from its comment tokens."
+  (let ((line-table (make-hash-table :test #'eq))
+        (file-rules '())
+        (ranges '())
+        (open (make-hash-table :test #'equal))
+        (last-line 1))
+    (dolist (token (sv-lint-context-tokens ctx))
+      (setq last-line (max last-line (sv-token-line token)))
+      (when (eq (sv-token-type token) 'comment)
+        (let ((text (sv-token-text token))
+              (line (sv-token-line token)))
+          (when (string-match
+                 "sv-lint:?[ \t]+disable\\(-next-line\\|-file\\)?\\(?:[ \t]*=[ \t]*\\([^*\n]*\\)\\)?"
+                 text)
+            (let* ((scope (match-string 1 text))
+                   (rules (sv-lint--parse-rule-names (match-string 2 text))))
+              (cond
+               ((equal scope "-file") (setq file-rules (append rules file-rules)))
+               ((equal scope "-next-line")
+                (puthash (1+ line) (append rules (gethash (1+ line) line-table))
+                         line-table))
+               (t (puthash line (append rules (gethash line line-table))
+                           line-table)))))
+          ;; Verilator pragmas, mapped onto the equivalent rule.
+          (let ((start 0))
+            (while (string-match "verilator[ \t]+lint_\\(off\\|on\\)[ \t]+\\([A-Z_0-9]+\\)"
+                                 text start)
+              (setq start (match-end 0))
+              (let* ((action (match-string 1 text))
+                     (code (match-string 2 text))
+                     (rule (cdr (assoc code sv-lint-verilator-alias))))
+                (when rule
+                  (if (equal action "off")
+                      (puthash code line open)
+                    (let ((from (gethash code open)))
+                      (when from
+                        (push (list rule from line) ranges)
+                        (remhash code open)))))))))))
+    (maphash (lambda (code from)
+               (let ((rule (cdr (assoc code sv-lint-verilator-alias))))
+                 (when rule (push (list rule from last-line) ranges))))
+             open)
+    (setf (sv-lint-context-suppress-file ctx) file-rules)
+    (setf (sv-lint-context-suppress-line ctx) line-table)
+    (setf (sv-lint-context-suppress-ranges ctx) ranges)))
+
+
+;;;; Declaration and reference gathering
+
+(defvar sv-lint--decls nil
+  "Accumulator used while walking a unit for declarations.")
+
+(defun sv-lint--record-decl (name kind line token &optional extra)
+  "Push a declaration record built from NAME, KIND, LINE, TOKEN and EXTRA."
+  (when (and name (stringp name))
+    (push (append (list :name name :kind kind :line line :token token) extra)
+          sv-lint--decls)))
+
+(defun sv-lint--header-names (tokens)
+  "Return identifiers declared by a loop header TOKENS such as `for (int i...)'."
+  (let ((names '()) (previous nil) (bracket-depth 0) (foreach nil))
+    (dolist (tok tokens)
+      (let ((text (sv-token-text tok)))
+        (cond
+         ((equal text "[") (setq bracket-depth (1+ bracket-depth) foreach t))
+         ((equal text "]") (setq bracket-depth (max 0 (1- bracket-depth))))
+         ((and (eq (sv-token-type tok) 'ident)
+               (or (and previous
+                        (or (member (sv-token-text previous) sv-lexer-data-types)
+                            (member (sv-token-text previous) '("genvar" "var"))))
+                   (and foreach (> bracket-depth 0))))
+          (push (cons (sv-token-text tok) tok) names)))
+        (setq previous tok)))
+    (nreverse names)))
+
+(defun sv-lint--scan-decls (node)
+  "Collect every name NODE declares, recursively."
+  (when (and node (listp node) (plist-member node :type))
+    (let ((type (plist-get node :type)))
+      (cl-case type
+        (decl
+         (dolist (name (plist-get node :names))
+           (sv-lint--record-decl (plist-get name :name)
+                                 (if (plist-get node :nettype) 'net 'var)
+                                 (plist-get name :line) (plist-get name :token)
+                                 (list :node node :decl name))))
+        (param
+         (dolist (param (plist-get node :params))
+           (sv-lint--record-decl (plist-get param :name) 'param
+                                 (plist-get param :line) (plist-get param :token)
+                                 (list :node node))))
+        (genvar
+         (dolist (name (plist-get node :names))
+           (sv-lint--record-decl (plist-get name :name) 'genvar
+                                 (plist-get name :line) (plist-get name :token))))
+        (typedef
+         (sv-lint--record-decl (plist-get node :name) 'typedef
+                               (plist-get node :line) nil)
+         (dolist (member (plist-get node :enum-members))
+           (sv-lint--record-decl (plist-get member :name) 'enum
+                                 (plist-get member :line) nil)))
+        ((task function)
+         (sv-lint--record-decl (plist-get node :name) type
+                               (plist-get node :line) nil)
+         (dolist (arg (plist-get node :args))
+           (sv-lint--record-decl (plist-get arg :name) 'arg
+                                 (plist-get arg :line) (plist-get arg :token)))
+         (mapc #'sv-lint--scan-decls (plist-get node :body)))
+        (instance
+         (dolist (sibling (plist-get node :siblings))
+           (sv-lint--record-decl (plist-get sibling :name) 'instance
+                                 (plist-get sibling :line) nil)))
+        ((generate generate-block)
+         (sv-lint--record-decl (plist-get node :label) 'label
+                               (plist-get node :line) nil)
+         (mapc #'sv-lint--scan-decls (plist-get node :items)))
+        (generate-for
+         (dolist (pair (sv-lint--header-names (plist-get node :header)))
+           (sv-lint--record-decl (car pair) 'genvar
+                                 (sv-token-line (cdr pair)) (cdr pair)))
+         (sv-lint--scan-decls (plist-get node :body)))
+        (generate-if
+         (sv-lint--scan-decls (plist-get node :then))
+         (sv-lint--scan-decls (plist-get node :else)))
+        (generate-case
+         (mapc #'sv-lint--scan-decls (plist-get node :items)))
+        (block
+         (sv-lint--record-decl (plist-get node :label) 'label
+                               (plist-get node :line) nil)
+         (mapc #'sv-lint--scan-decls (plist-get node :stmts)))
+        (fork (mapc #'sv-lint--scan-decls (plist-get node :stmts)))
+        ((always initial final)
+         (sv-lint--scan-decls (plist-get node :body)))
+        (if
+         (sv-lint--scan-decls (plist-get node :then))
+         (sv-lint--scan-decls (plist-get node :else)))
+        (case
+         (dolist (item (plist-get node :items))
+           (sv-lint--scan-decls (plist-get item :stmt))))
+        (loop
+         (dolist (pair (sv-lint--header-names (plist-get node :header)))
+           (sv-lint--record-decl (car pair) 'loopvar
+                                 (sv-token-line (cdr pair)) (cdr pair)))
+         (sv-lint--scan-decls (plist-get node :body)))
+        (t nil)))))
+
+(defun sv-lint--unit-declarations (unit)
+  "Return every declaration made by UNIT, ports and parameters included."
+  (let ((sv-lint--decls '()))
+    (dolist (param (plist-get unit :params))
+      (sv-lint--record-decl (plist-get param :name) 'param
+                            (plist-get param :line) (plist-get param :token)))
+    (dolist (port (plist-get unit :ports))
+      (sv-lint--record-decl (plist-get port :name) 'port
+                            (plist-get port :line) (plist-get port :token)
+                            (list :dir (plist-get port :dir) :port port)))
+    (mapc #'sv-lint--scan-decls (plist-get unit :items))
+    (nreverse sv-lint--decls)))
+
+(defun sv-lint--ignored-tokens (unit declarations)
+  "Return a hash of tokens that must not count as references inside UNIT.
+Covers declared names themselves and the module name of each instance."
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (decl declarations)
+      (when (plist-get decl :token) (puthash (plist-get decl :token) t table)))
+    (dolist (instance (sv-parse-collect unit 'instance))
+      (puthash (plist-get instance :beg) t table))
+    ;; `modport m (...)' and friends name a scope, not a signal.
+    (dolist (node (sv-parse-collect unit 'other))
+      (when (plist-get node :beg)
+        (puthash (1+ (plist-get node :beg)) t table)))
+    table))
+
+(defun sv-lint--references (ctx unit ignored)
+  "Return the identifier references of UNIT as (name . token) pairs.
+IGNORED holds declaration tokens, plus the token index of instance types."
+  (let* ((vec (sv-lint-context-significant ctx))
+         (limit (length vec))
+         (beg (or (plist-get unit :beg) 0))
+         (end (min (or (plist-get unit :end) limit) limit))
+         (refs '()))
+    (cl-loop
+     for i from beg below end
+     for tok = (aref vec i)
+     when (and (eq (sv-token-type tok) 'ident)
+               (not (gethash tok ignored))
+               (not (gethash i ignored))
+               (let ((prev (and (> i beg) (aref vec (1- i)))))
+                 (not (and prev (member (sv-token-text prev)
+                                        '("." "::" "module" "macromodule"
+                                          "interface" "package" "program"
+                                          "class" "function" "task"
+                                          "endmodule" "endinterface"
+                                          "endpackage" "endprogram" "endclass"
+                                          "endfunction" "endtask")))))
+               (let ((next (and (< (1+ i) end) (aref vec (1+ i)))))
+                 (not (and next (equal (sv-token-text next) "::")))))
+     do (push (cons (sv-token-text tok) tok) refs))
+    (nreverse refs)))
+
+
+;;;; Statement analysis helpers
+
+(defun sv-lint--statements (node)
+  "Return NODE and every statement nested inside it, depth first."
+  (let ((found '()))
+    (cl-labels
+        ((walk (stmt)
+           (when (and stmt (listp stmt) (plist-member stmt :type))
+             (push stmt found)
+             (cl-case (plist-get stmt :type)
+               (block (mapc #'walk (plist-get stmt :stmts)))
+               (fork (mapc #'walk (plist-get stmt :stmts)))
+               (if (walk (plist-get stmt :then)) (walk (plist-get stmt :else)))
+               (case (dolist (item (plist-get stmt :items))
+                       (walk (plist-get item :stmt))))
+               (loop (walk (plist-get stmt :body)))
+               ((always initial final) (walk (plist-get stmt :body)))
+               ((module interface program package generate generate-block)
+                (mapc #'walk (plist-get stmt :items)))
+               (generate-for (walk (plist-get stmt :body)))
+               (generate-if (walk (plist-get stmt :then))
+                            (walk (plist-get stmt :else)))
+               (generate-case (mapc #'walk (plist-get stmt :items)))
+               ((task function) (mapc #'walk (plist-get stmt :body)))
+               (t nil)))))
+      (walk node))
+    (nreverse found)))
+
+(defun sv-lint--assigned-names (node)
+  "Return every signal NODE assigns to, on any path."
+  (let ((names '()))
+    (dolist (stmt (sv-lint--statements node))
+      (when (memq (plist-get stmt :type) '(assign continuous-assign))
+        (setq names (append (plist-get stmt :lhs-targets) names))))
+    (delete-dups names)))
+
+(defun sv-lint--write-tokens (node)
+  "Return a hash of the tokens NODE uses as assignment targets.
+Writing to a signal is not using it, so these occurrences must not keep
+`unused-declaration' quiet."
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (stmt (sv-lint--statements node))
+      (when (memq (plist-get stmt :type) '(assign continuous-assign))
+        (dolist (tok (sv-parse-lhs-tokens (plist-get stmt :lhs)))
+          (puthash tok t table))))
+    table))
+
+(defun sv-lint--must-assign (stmt)
+  "Return the signals STMT assigns on every path through it."
+  (when (and stmt (listp stmt) (plist-member stmt :type))
+    (cl-case (plist-get stmt :type)
+      ((assign continuous-assign) (copy-sequence (plist-get stmt :lhs-targets)))
+      (block (let ((names '()))
+               (dolist (inner (plist-get stmt :stmts))
+                 (setq names (append (sv-lint--must-assign inner) names)))
+               (delete-dups names)))
+      (if (let ((else (plist-get stmt :else)))
+            (when else
+              (cl-intersection (sv-lint--must-assign (plist-get stmt :then))
+                               (sv-lint--must-assign else)
+                               :test #'equal))))
+      (case (let ((items (plist-get stmt :items)))
+              (when (and items
+                         (or (cl-some (lambda (item) (plist-get item :default)) items)
+                             (memq (plist-get stmt :qualifier) '(unique unique0))))
+                (let ((common (sv-lint--must-assign (plist-get (car items) :stmt))))
+                  (dolist (item (cdr items))
+                    (setq common (cl-intersection
+                                  common (sv-lint--must-assign (plist-get item :stmt))
+                                  :test #'equal)))
+                  common))))
+      (t nil))))
+
+(defun sv-lint--read-tokens (stmt)
+  "Return the tokens STMT reads: right-hand sides, conditions and indices."
+  (let ((tokens '()))
+    (dolist (inner (sv-lint--statements stmt))
+      (cl-case (plist-get inner :type)
+        ((assign continuous-assign)
+         (setq tokens (append (plist-get inner :rhs) tokens))
+         ;; Index expressions on the left-hand side are reads too.
+         (let ((depth 0))
+           (dolist (tok (plist-get inner :lhs))
+             (let ((text (sv-token-text tok)))
+               (cond ((equal text "[") (setq depth (1+ depth)))
+                     ((equal text "]") (setq depth (max 0 (1- depth))))
+                     ((> depth 0) (push tok tokens)))))))
+        (if (setq tokens (append (plist-get inner :cond) tokens)))
+        (case (setq tokens (append (plist-get inner :expr) tokens))
+              (dolist (item (plist-get inner :items))
+                (setq tokens (append (plist-get item :labels) tokens))))
+        (loop (setq tokens (append (plist-get inner :header) tokens)))
+        (expr (setq tokens (append (plist-get inner :tokens) tokens)))
+        (t nil)))
+    tokens))
+
+(defun sv-lint--token-names (tokens)
+  "Return the identifier names referenced by TOKENS."
+  (let ((names '()) (previous nil))
+    (dolist (tok tokens)
+      (when (and (eq (sv-token-type tok) 'ident)
+                 (not (and previous (member (sv-token-text previous) '("." "::")))))
+        (push (sv-token-text tok) names))
+      (setq previous tok))
+    (delete-dups (nreverse names))))
+
+(defun sv-lint--combinational-p (node)
+  "Return non-nil when the procedural block NODE describes combinational logic."
+  (let ((kind (plist-get node :kind)))
+    (or (eq kind 'always_comb)
+        (and (eq kind 'always)
+             (or (plist-get node :star)
+                 (not (cl-some (lambda (tok)
+                                 (member (sv-token-text tok) '("posedge" "negedge")))
+                               (plist-get node :sensitivity))))))))
+
+
+;;;; Rules
+
+(defun sv-lint--rule-procedural (ctx unit)
+  "Check the procedural blocks of UNIT for assignment and latch problems."
+  (dolist (node (plist-get unit :items))
+    (when (eq (plist-get node :type) 'always)
+      (let* ((kind (plist-get node :kind))
+             (body (plist-get node :body))
+             (statements (sv-lint--statements body))
+             (local (let ((sv-lint--decls '()))
+                      (sv-lint--scan-decls body)
+                      (mapcar (lambda (decl) (plist-get decl :name)) sv-lint--decls))))
+        (when (eq kind 'always_ff)
+          (dolist (stmt statements)
+            (when (and (eq (plist-get stmt :type) 'assign)
+                       (equal (plist-get stmt :op) "=")
+                       (not (cl-every (lambda (name) (member name local))
+                                      (plist-get stmt :lhs-targets))))
+              (sv-lint--report ctx 'blocking-in-always-ff
+                               (plist-get stmt :line) nil
+                               (format "Blocking assignment to `%s' inside always_ff; use `<='."
+                                       (or (plist-get stmt :target) "signal"))))))
+
+        (when (sv-lint--combinational-p node)
+          (dolist (stmt statements)
+            (when (and (eq (plist-get stmt :type) 'assign)
+                       (equal (plist-get stmt :op) "<="))
+              (sv-lint--report ctx 'nonblocking-in-always-comb
+                               (plist-get stmt :line) nil
+                               (format "Non-blocking assignment to `%s' in combinational logic; use `='."
+                                       (or (plist-get stmt :target) "signal")))))
+          (let* ((assigned (sv-lint--assigned-names body))
+                 (guaranteed (sv-lint--must-assign body))
+                 (latched (cl-set-difference assigned guaranteed :test #'equal)))
+            (dolist (name (sort latched #'string<))
+              (unless (member name local)
+                (sv-lint--report ctx 'implicit-latch (plist-get node :line) nil
+                                 (format "`%s' is not assigned on every path; a latch is inferred."
+                                         name))))))
+
+        (when (and (eq kind 'always) (plist-get node :star))
+          (sv-lint--report ctx 'prefer-always-comb (plist-get node :line) nil
+                           "Use `always_comb' instead of `always @(*)'."))
+
+        (when (and (eq kind 'always)
+                   (sv-lint--combinational-p node)
+                   (not (plist-get node :star))
+                   (plist-get node :sensitivity))
+          (let* ((listed (sv-lint--token-names (plist-get node :sensitivity)))
+                 (assigned (sv-lint--assigned-names body))
+                 (read (sv-lint--token-names (sv-lint--read-tokens body)))
+                 (missing (cl-set-difference
+                           (cl-set-difference read listed :test #'equal)
+                           assigned :test #'equal)))
+            (dolist (name (sort missing #'string<))
+              (unless (member name local)
+                (sv-lint--report ctx 'incomplete-sensitivity (plist-get node :line) nil
+                                 (format "`%s' is read but missing from the sensitivity list."
+                                         name))))))))))
+
+(defun sv-lint--rule-case (ctx unit)
+  "Check that every case statement of UNIT has a default arm."
+  (dolist (node (sv-parse-collect unit 'always))
+    (dolist (stmt (sv-lint--statements (plist-get node :body)))
+      (when (eq (plist-get stmt :type) 'case)
+        (let ((items (plist-get stmt :items))
+              (qualifier (plist-get stmt :qualifier)))
+          (unless (or (cl-some (lambda (item) (plist-get item :default)) items)
+                      (and sv-lint-case-default-exempt-qualified
+                           (memq qualifier '(unique unique0 priority))))
+            (sv-lint--report ctx 'case-without-default (plist-get stmt :line) nil
+                             (format "`%s' has no default arm."
+                                     (plist-get stmt :kind)))))))))
+
+(defun sv-lint--rule-names (ctx unit)
+  "Check UNIT for undeclared, unused and duplicated names."
+  (let* ((declarations (sv-lint--unit-declarations unit))
+         (ignored (sv-lint--ignored-tokens unit declarations))
+         (references (sv-lint--references ctx unit ignored))
+         (declared (make-hash-table :test #'equal))
+         (used (make-hash-table :test #'equal))
+         (file-names (sv-lint-context-modules ctx))
+         (has-import (or (cl-some (lambda (item) (eq (plist-get item :type) 'import))
+                                  (plist-get unit :items))
+                         (cl-some (lambda (tok)
+                                    (and (eq (sv-token-type tok) 'directive)
+                                         (member (sv-token-text tok)
+                                                 '("`include" "`define"))))
+                                  (sv-lint-context-tokens ctx)))))
+    ;; Duplicate declarations, ignoring the ones a generate block legitimately
+    ;; repeats in separate scopes.
+    (dolist (decl declarations)
+      (let* ((name (plist-get decl :name))
+             (previous (gethash name declared)))
+        (if (and previous
+                 (not (memq (plist-get decl :kind) '(label genvar loopvar arg)))
+                 (not (memq (plist-get previous :kind) '(label genvar loopvar arg))))
+            (sv-lint--report ctx 'duplicate-declaration (plist-get decl :line) nil
+                             (format "`%s' is already declared on line %d."
+                                     name (plist-get previous :line)))
+          (puthash name decl declared))))
+
+    (let ((writes (sv-lint--write-tokens unit)))
+      (dolist (reference references)
+        (unless (gethash (cdr reference) writes)
+          (puthash (car reference) t used))))
+
+    (unless has-import
+      (dolist (reference references)
+        (let ((name (car reference)))
+          (unless (or (gethash name declared)
+                      (and file-names (gethash name file-names)))
+            (sv-lint--report-token ctx 'undeclared-identifier (cdr reference)
+                                   (format "`%s' is used but never declared." name))))))
+
+    (dolist (decl declarations)
+      (let ((name (plist-get decl :name))
+            (kind (plist-get decl :kind)))
+        (unless (or (gethash name used)
+                    (string-match-p sv-lint-ignored-name-regexp name))
+          (cl-case kind
+            ((var net)
+             (sv-lint--report ctx 'unused-declaration (plist-get decl :line) nil
+                              (format "`%s' is declared but never used." name)))
+            (param
+             (sv-lint--report ctx 'unused-parameter (plist-get decl :line) nil
+                              (format "Parameter `%s' is never used." name)))
+            (t nil)))))
+
+    ;; Outputs need a driver: a procedural or continuous assignment, or a
+    ;; connection to an instance port.
+    (let ((driven (sv-lint--assigned-names unit)))
+      (dolist (instance (sv-parse-collect unit 'instance))
+        (dolist (sibling (plist-get instance :siblings))
+          (dolist (connection (plist-get sibling :connections))
+            (setq driven (append (sv-lint--token-names (plist-get connection :expr))
+                                 driven))
+            (when (plist-get connection :implicit)
+              (push (plist-get connection :name) driven)))))
+      (dolist (port (plist-get unit :ports))
+        (when (and (eq (plist-get port :dir) 'output)
+                   (not (member (plist-get port :name) driven)))
+          (sv-lint--report ctx 'undriven-output (plist-get port :line)
+                           (plist-get port :col)
+                           (format "Output `%s' is never driven."
+                                   (plist-get port :name))))))
+
+    (when (sv-lint--rule-enabled-p 'port-naming)
+      (dolist (port (plist-get unit :ports))
+        (let ((regexp (cdr (assq (plist-get port :dir) sv-lint-port-prefixes)))
+              (name (plist-get port :name)))
+          (when (and regexp name (not (string-match-p regexp name)))
+            (sv-lint--report ctx 'port-naming (plist-get port :line)
+                             (plist-get port :col)
+                             (format "%s port `%s' should match \"%s\"."
+                                     (plist-get port :dir) name regexp))))))))
+
+(defun sv-lint--rule-instances (ctx unit)
+  "Check the instantiations of UNIT against the known module interfaces."
+  (let ((modules (sv-lint-context-modules ctx)))
+    (dolist (instance (sv-parse-collect unit 'instance))
+      (dolist (sibling (plist-get instance :siblings))
+        (let* ((connections (plist-get sibling :connections))
+               (target (and modules (gethash (plist-get instance :module) modules)))
+               (ports (and (listp target) (plist-get target :ports))))
+          (when (cl-some (lambda (connection) (plist-get connection :positional))
+                         connections)
+            (sv-lint--report ctx 'positional-port-connection
+                             (plist-get sibling :line) nil
+                             (format "Instance `%s' of `%s' connects ports by position; use named connections."
+                                     (plist-get sibling :name)
+                                     (plist-get instance :module))))
+          (dolist (connection connections)
+            (when (and (plist-get connection :name)
+                       (not (plist-get connection :implicit))
+                       (null (plist-get connection :expr)))
+              (sv-lint--report-token ctx 'unconnected-port
+                                     (plist-get connection :token)
+                                     (format "Port `%s' of instance `%s' is left unconnected."
+                                             (plist-get connection :name)
+                                             (plist-get sibling :name)))))
+          (when ports
+            (let ((names (mapcar (lambda (port) (plist-get port :name)) ports))
+                  (connected '())
+                  (wildcard (cl-some (lambda (connection)
+                                       (plist-get connection :wildcard))
+                                     connections)))
+              (dolist (connection connections)
+                (when (plist-get connection :name)
+                  (push (plist-get connection :name) connected)
+                  (unless (member (plist-get connection :name) names)
+                    (sv-lint--report-token
+                     ctx 'instance-unknown-port (plist-get connection :token)
+                     (format "`%s' has no port `%s'."
+                             (plist-get instance :module)
+                             (plist-get connection :name))))))
+              (unless (or wildcard
+                          (cl-some (lambda (connection) (plist-get connection :positional))
+                                   connections))
+                (dolist (name names)
+                  (unless (member name connected)
+                    (sv-lint--report ctx 'instance-missing-port
+                                     (plist-get sibling :line) nil
+                                     (format "Instance `%s' does not connect port `%s' of `%s'."
+                                             (plist-get sibling :name) name
+                                             (plist-get instance :module)))))))))))))
+
+(defun sv-lint--rule-generate (ctx unit)
+  "Check that the generate blocks of UNIT are labelled."
+  (dolist (type '(generate-for generate-if))
+    (dolist (node (sv-parse-collect unit type))
+      (dolist (branch (list (plist-get node :body) (plist-get node :then)
+                            (plist-get node :else)))
+        (when (and branch (eq (plist-get branch :type) 'generate-block)
+                   (null (plist-get branch :label)))
+          (sv-lint--report ctx 'unlabeled-generate-block (plist-get branch :line) nil
+                           "Generate block has no label; name it `begin : name'."))))))
+
+(defun sv-lint--rule-unit-style (ctx unit)
+  "Check UNIT for file-naming and declaration-style problems."
+  (let ((file (sv-lint-context-file ctx))
+        (name (plist-get unit :name)))
+    (when (and file name (eq (plist-get unit :type) 'module)
+               (eq unit (car (plist-get (sv-lint-context-tree ctx) :units)))
+               (not (equal name (file-name-base file))))
+      (sv-lint--report ctx 'module-filename-mismatch (plist-get unit :line) nil
+                       (format "Module `%s' lives in %s; the names should match."
+                               name (file-name-nondirectory file)))))
+  (dolist (node (plist-get unit :items))
+    (when (eq (plist-get node :type) 'decl)
+      (let ((datatype (or (plist-get node :datatype) "")))
+        (when (string-match-p "\\`\\(?:reg\\|wire\\)\\b" datatype)
+          (sv-lint--report ctx 'legacy-net-type (plist-get node :line) nil
+                           (format "Prefer `logic' over `%s'."
+                                   (car (split-string datatype " " t)))))))))
+
+(defun sv-lint--rule-whitespace (ctx)
+  "Check the raw lines of CTX for whitespace problems."
+  (let ((line 1))
+    (dolist (text (sv-lint-context-lines ctx))
+      (when (> (length text) sv-lint-max-line-length)
+        (sv-lint--report ctx 'line-too-long line sv-lint-max-line-length
+                         (format "Line is %d columns wide; the limit is %d."
+                                 (length text) sv-lint-max-line-length)))
+      (when (string-match "[ \t]+\\'" text)
+        (sv-lint--report ctx 'trailing-whitespace line (match-beginning 0)
+                         "Line has trailing whitespace."))
+      (when (string-match-p "\\`[ \t]*\t" text)
+        (sv-lint--report ctx 'tab-indentation line 0
+                         "Line is indented with a tab."))
+      (setq line (1+ line))))
+  (let ((text (sv-lint-context-text ctx)))
+    (when (and (> (length text) 0) (not (string-suffix-p "\n" text)))
+      (sv-lint--report ctx 'missing-final-newline
+                       (length (sv-lint-context-lines ctx)) 0
+                       "File does not end with a newline."))))
+
+
+;;;; Entry points
+
+(defun sv-lint-module-table (tree &optional table)
+  "Add every design unit of TREE to TABLE, creating it when absent.
+Returns the table, which maps a unit name to its node."
+  (let ((table (or table (make-hash-table :test #'equal))))
+    (dolist (unit (plist-get tree :units))
+      (when (plist-get unit :name)
+        (puthash (plist-get unit :name) unit table))
+      ;; Names a unit exports to the rest of the file.
+      (dolist (type '(typedef function task param))
+        (dolist (node (sv-parse-collect unit type))
+          (cl-case type
+            (param (dolist (param (plist-get node :params))
+                     (puthash (plist-get param :name) 'name table)))
+            (typedef (puthash (plist-get node :name) 'name table)
+                     (dolist (member (plist-get node :enum-members))
+                       (puthash (plist-get member :name) 'name table)))
+            (t (puthash (plist-get node :name) 'name table))))))
+    table))
+
+(defun sv-lint-build-module-table (files)
+  "Build a module table by parsing every file of FILES."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (file files)
+      (condition-case nil
+          (sv-lint-module-table (sv-parse-file file) table)
+        (error nil)))
+    table))
+
+(defun sv-lint-analyze (text &optional file modules)
+  "Lint TEXT, said to come from FILE, and return its diagnostics.
+MODULES is an optional table of known design units, as built by
+`sv-lint-build-module-table', enabling the cross-module rules."
+  (let* ((tokens (sv-lex-string text))
+         (tree (sv-parse-tokens tokens))
+         (ctx (sv-lint-context-create
+               :file file
+               :text text
+               :lines (split-string text "\n")
+               :tree tree
+               :tokens tokens
+               :significant (plist-get tree :significant)
+               :modules (or modules (sv-lint-module-table tree))
+               :diagnostics '())))
+    (sv-lint--scan-suppressions ctx)
+    (dolist (unit (plist-get tree :units))
+      (when (memq (plist-get unit :type) '(module interface program))
+        (sv-lint--rule-procedural ctx unit)
+        (sv-lint--rule-case ctx unit)
+        (sv-lint--rule-names ctx unit)
+        (sv-lint--rule-instances ctx unit)
+        (sv-lint--rule-generate ctx unit)
+        (sv-lint--rule-unit-style ctx unit)))
+    (sv-lint--rule-whitespace ctx)
+    (sort (nreverse (sv-lint-context-diagnostics ctx))
+          (lambda (a b)
+            (if (= (sv-diagnostic-line a) (sv-diagnostic-line b))
+                (< (sv-diagnostic-col a) (sv-diagnostic-col b))
+              (< (sv-diagnostic-line a) (sv-diagnostic-line b)))))))
+
+(defun sv-lint-buffer (&optional buffer modules)
+  "Lint BUFFER, the current one by default, against MODULES."
+  (with-current-buffer (or buffer (current-buffer))
+    (sv-lint-analyze (buffer-substring-no-properties (point-min) (point-max))
+                     (buffer-file-name) modules)))
+
+(defun sv-lint-file (file &optional modules)
+  "Lint FILE against the optional MODULES table."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (sv-lint-analyze (buffer-substring-no-properties (point-min) (point-max))
+                     file modules)))
+
+(defun sv-diagnostic-format (diagnostic)
+  "Render DIAGNOSTIC the way compilers do, for `compilation-mode'."
+  (format "%s:%d:%d: %s: %s [%s]"
+          (or (sv-diagnostic-file diagnostic) "<buffer>")
+          (sv-diagnostic-line diagnostic)
+          (1+ (sv-diagnostic-col diagnostic))
+          (sv-diagnostic-severity diagnostic)
+          (sv-diagnostic-message diagnostic)
+          (sv-diagnostic-rule diagnostic)))
+
+(provide 'sv-lint)
+
+;;; sv-lint.el ends here

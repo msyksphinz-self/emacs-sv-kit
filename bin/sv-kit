@@ -1,0 +1,5 @@
+#!/bin/sh
+# Command-line front end for sv-kit: lint, format or summarize SystemVerilog.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${EMACS:-emacs}" --batch -Q -L "$here/../lisp" -l sv-kit -f sv-kit-batch "$@"
