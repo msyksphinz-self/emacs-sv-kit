@@ -234,6 +234,7 @@ it.  With FORCE non-nil, rescan the file list as well."
   (let ((units (make-hash-table :test #'equal))
         (unit-files (make-hash-table :test #'equal))
         (symbols (make-hash-table :test #'equal))
+        (types (make-hash-table :test #'equal))
         (files (sv-index-project-files root force)))
     (dolist (file files)
       (let* ((indexed (sv-index-file file))
@@ -241,10 +242,14 @@ it.  With FORCE non-nil, rescan the file list as well."
         (dolist (unit (plist-get tree :units))
           (when (plist-get unit :name)
             (puthash (plist-get unit :name) unit units)
-            (puthash (plist-get unit :name) file unit-files)))
+            (puthash (plist-get unit :name) file unit-files))
+          (dolist (typedef (sv-parse-collect unit 'typedef))
+            (when (plist-get typedef :name)
+              (puthash (plist-get typedef :name) typedef types))))
         (dolist (symbol (cdr indexed))
           (push symbol (gethash (sv-symbol-name symbol) symbols)))))
-    (list :units units :unit-files unit-files :symbols symbols :files files)))
+    (list :units units :unit-files unit-files :symbols symbols
+          :types types :files files)))
 
 (defun sv-index-unit (name &optional root)
   "Return the design unit called NAME in the project under ROOT."
@@ -253,6 +258,10 @@ it.  With FORCE non-nil, rescan the file list as well."
 (defun sv-index-unit-file (name &optional root)
   "Return the file that declares the design unit called NAME under ROOT."
   (gethash name (plist-get (sv-index-project root) :unit-files)))
+
+(defun sv-index-type (name &optional root)
+  "Return the typedef called NAME in the project under ROOT."
+  (gethash name (plist-get (sv-index-project root) :types)))
 
 (defun sv-index-lookup (name &optional root)
   "Return the project symbols called NAME under ROOT."

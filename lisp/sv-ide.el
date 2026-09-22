@@ -140,6 +140,101 @@ The value is a plist with `:module', `:instance', `:open' and
     found))
 
 
+;;;; Types and their members
+
+(defun sv-ide-type-name (datatype)
+  "Return the bare type name DATATYPE mentions, without its qualifiers."
+  (when datatype
+    (let ((words (split-string datatype "[ \t]+" t)))
+      (setq words (cl-remove-if
+                   (lambda (word)
+                     (member word '("var" "const" "static" "automatic" "signed"
+                                    "unsigned" "packed" "virtual" "rand" "randc")))
+                   words))
+      (let ((name (car (last words))))
+        (when name
+          ;; `pkg::entry_t' names the type entry_t.
+          (if (string-match "\\`\\(?:.*::\\)?\\([A-Za-z_][A-Za-z0-9_$]*\\)\\'" name)
+              (match-string 1 name)
+            name))))))
+
+(defun sv-ide-typedef (name)
+  "Return the typedef called NAME, looking in this buffer before the project."
+  (when name
+    (let* ((tree (car (sv-index-buffer)))
+           (found nil))
+      (dolist (unit (plist-get tree :units))
+        (dolist (typedef (sv-parse-collect unit 'typedef))
+          (when (and (null found) (equal (plist-get typedef :name) name))
+            (setq found typedef))))
+      (or found (sv-index-type name)))))
+
+(defun sv-ide--signal-datatype (name)
+  "Return the data type the signal NAME is declared with, in this buffer."
+  (let ((unit (sv-ide--enclosing-unit))
+        (found nil))
+    (dolist (record (and unit (sv-parse-declarations unit)))
+      (when (and (null found) (equal (plist-get record :name) name))
+        (let ((declarator (or (plist-get record :decl) (plist-get record :port))))
+          (when declarator (setq found (plist-get declarator :datatype))))))
+    found))
+
+(defun sv-ide-dotted-prefix (&optional position)
+  "Return the chain of names before the dot at POSITION, outermost first.
+For `a.b.\=' the answer is the names a and b in that order, and a select
+on the way is stepped over."
+  (save-excursion
+    (when position (goto-char position))
+    (let ((names '()) (scanning t))
+      (while scanning
+        (skip-chars-backward " \t\n")
+        (while (and scanning (eq (char-before) ?\]))
+          (condition-case nil (backward-sexp) (error (setq scanning nil)))
+          (skip-chars-backward " \t\n"))
+        (let ((name (and scanning (sv-ide--identifier-before))))
+          (if (null name)
+              (setq scanning nil)
+            (push name names)
+            (skip-chars-backward " \t\n")
+            (if (eq (char-before) ?.)
+                (backward-char 1)
+              (setq scanning nil)))))
+      names)))
+
+(defun sv-ide-field-type (names)
+  "Return the typedef the dotted NAMES end at, or nil."
+  (let ((node (sv-ide-typedef
+               (sv-ide-type-name (sv-ide--signal-datatype (car names))))))
+    (dolist (field (cdr names))
+      (setq node
+            (when node
+              (let ((member (cl-find field (plist-get node :members)
+                                     :key (lambda (m) (plist-get m :name))
+                                     :test #'equal)))
+                (when member
+                  (sv-ide-typedef
+                   (sv-ide-type-name (plist-get member :datatype))))))))
+    node))
+
+(defun sv-ide--field-candidates (names)
+  "Return (CANDIDATES . ANNOTATIONS) for the members of the type NAMES reach."
+  (let ((node (sv-ide-field-type names))
+        (candidates '())
+        (annotations (make-hash-table :test #'equal)))
+    (when node
+      (dolist (member (plist-get node :members))
+        (let ((name (plist-get member :name)))
+          (when name
+            (puthash name (format " %s" (sv-index--declarator-signature member))
+                     annotations)
+            (push name candidates))))
+      (dolist (literal (plist-get node :enum-members))
+        (let ((name (plist-get literal :name)))
+          (puthash name " enumeration literal" annotations)
+          (push name candidates)))
+      (cons (nreverse candidates) annotations))))
+
+
 ;;;; Completion
 
 (defun sv-ide--scope-symbols ()
@@ -203,7 +298,8 @@ Suitable as a member of `completion-at-point-functions'."
                      context (buffer-substring-no-properties start end)))
            (after-quote
             (cons (sv-index-macros) (make-hash-table :test #'equal)))
-           (after-dot nil)
+           (after-dot (sv-ide--field-candidates
+                       (sv-ide-dotted-prefix (1- start))))
            (system-task
             (cons sv-ide-system-tasks (make-hash-table :test #'equal)))
            (t
@@ -365,9 +461,23 @@ FILE names the file the buffer holds."
                              (or (plist-get port :datatype) "")
                              (sv-parse-token-string (plist-get port :packed)))))))))))
 
+(defun sv-ide--field-documentation ()
+  "Return the declaration of the struct field at point, when there is one."
+  (let ((bounds (bounds-of-thing-at-point 'symbol)))
+    (when (and bounds (eq (char-before (car bounds)) ?.))
+      (let* ((name (buffer-substring-no-properties (car bounds) (cdr bounds)))
+             (node (sv-ide-field-type (sv-ide-dotted-prefix (1- (car bounds)))))
+             (member (cl-find name (plist-get node :members)
+                              :key (lambda (m) (plist-get m :name))
+                              :test #'equal)))
+        (when member
+          (format "%s.%s: %s" (plist-get node :name) name
+                  (sv-index--declarator-signature member)))))))
+
 (defun sv-ide-documentation-at-point ()
   "Return a one-line description of the SystemVerilog name at point."
   (or (sv-ide--port-documentation)
+      (sv-ide--field-documentation)
       (let ((identifier (thing-at-point 'symbol t)))
         (when identifier
           (let ((symbol (car (sv-ide--definitions identifier))))

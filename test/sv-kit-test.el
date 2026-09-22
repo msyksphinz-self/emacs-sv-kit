@@ -1144,6 +1144,69 @@ OCCURRENCE selects which match to look at, counting from one."
     (should (equal (sv-ide-documentation-at-point)
                    "sub_block.i_data: input logic [W-1:0]"))))
 
+(defconst sv-test-struct-source
+  "module probe;
+     typedef struct packed { logic valid; logic [7:0] payload; } inner_t;
+     typedef struct packed { inner_t head; logic [3:0] id; } outer_t;
+     outer_t w_pkt;
+     outer_t w_arr [4];
+   endmodule
+"
+  "A module with nested packed structs, for the field-aware features.")
+
+(defun sv-test-insert-in-module (text)
+  "Insert TEXT just above the `endmodule' of this buffer, and stay after it."
+  (goto-char (point-min))
+  (search-forward "endmodule")
+  (beginning-of-line)
+  (insert text))
+
+(ert-deftest sv-ide-completes-the-fields-of-a-struct ()
+  (sv-test-with-source sv-test-struct-source
+    (sv-test-insert-in-module "  assign x = w_pkt.")
+    (should (equal (nth 2 (sv-ide-completion-at-point)) '("head" "id")))))
+
+(ert-deftest sv-ide-completes-through-a-nested-struct-and-an-array ()
+  (sv-test-with-source sv-test-struct-source
+    (sv-test-insert-in-module "  assign x = w_pkt.head.")
+    (should (equal (nth 2 (sv-ide-completion-at-point)) '("valid" "payload")))
+    (insert "valid;\n  assign y = w_arr[2].")
+    (should (equal (nth 2 (sv-ide-completion-at-point)) '("head" "id")))))
+
+(ert-deftest sv-ide-describes-a-struct-field ()
+  (sv-test-with-source sv-test-struct-source
+    (sv-test-insert-in-module "  assign x = w_pkt.head;\n")
+    (goto-char (point-min))
+    (search-forward "w_pkt.head")
+    (backward-char 2)
+    (should (equal (sv-ide-documentation-at-point) "outer_t.head: inner_t head"))))
+
+(ert-deftest sv-ide-resolves-a-dotted-prefix ()
+  (sv-test-with-source sv-test-struct-source
+    (sv-test-insert-in-module "  assign x = w_arr[1].head.")
+    (should (equal (sv-ide-dotted-prefix (1- (point))) '("w_arr" "head")))))
+
+(ert-deftest sv-kit-shows-the-instance-tree ()
+  (sv-test-with-project
+    (unwind-protect
+        (progn
+          (sv-kit-hierarchy "top_block")
+          (with-current-buffer "*sv-hierarchy*"
+            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "\\`top_block" text))
+              (should (string-match-p "u_first : sub_block" text))
+              (should (string-match-p "u_second : sub_block" text)))))
+      (when (get-buffer "*sv-hierarchy*") (kill-buffer "*sv-hierarchy*")))))
+
+(ert-deftest sv-mode-moves-over-a-block ()
+  (with-temp-buffer
+    (insert "module m;\n  always_comb begin\n    if (a) begin\n      x = 1;\n    end\n  end\nendmodule\n")
+    (sv-mode)
+    (goto-char (point-min))
+    (search-forward "always_comb ")
+    (sv-mode-forward-block)
+    (should (= (line-number-at-pos) 6))))
+
 (ert-deftest sv-kit-adds-the-ports-an-instance-leaves-out ()
   (sv-test-with-source
       "module probe;\n  logic clk;\n  sub_block u_sub (.i_clk (clk));\nendmodule\n"

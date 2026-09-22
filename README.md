@@ -89,6 +89,7 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 | `M-.` / `M-?` | `xref-find-definitions` / `-references` | 定義へジャンプ／参照一覧 |
 | `C-M-i` | `completion-at-point` | 文脈を見た補完 |
 | `C-c C-u` | `sv-kit-goto-unit` | ファイル内の design unit へジャンプ |
+| `C-c C-h` | `sv-kit-hierarchy` | インスタンス階層をツリー表示 |
 | `C-c C-t` | `sv-mode-update-user-types` | `typedef` を読み直してハイライトを更新 |
 | `C-M-a` / `C-M-e` | `beginning-of-defun` / `end-of-defun` | module / function 単位で移動 |
 
@@ -107,6 +108,9 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 
 - インスタンスの `.` の直後 → **そのモジュールが実際に持つポート**のうち、まだ
   接続していないものだけ。注釈に方向と型が出ます
+- 信号の `.` の直後 → **その構造体のメンバ**。入れ子（`pkt.head.` → 内側の
+  メンバ）と配列要素（`arr[2].`）も辿ります。型は同じファイル内の `typedef`
+  でもプロジェクト内の他ファイルのものでも構いません
 - `` ` `` の直後 → プロジェクト内の `` `define `` マクロ
 - `$` の直後 → システムタスク
 - それ以外 → 同じ module 内の信号・パラメータ・型を先頭に、続いてプロジェクトの
@@ -121,10 +125,12 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 **ElDoc**
 
 カーソル下の名前の宣言を 1 行で表示します。インスタンスのポート名
-（`.i_data` など）の上では、**接続先モジュール側の宣言**を表示します。
+（`.i_data` など）の上では**接続先モジュール側の宣言**を、構造体のメンバの上では
+**その型のメンバ宣言**を表示します。
 
 ```
 sub_block.i_data: input logic [W-1:0]
+outer_t.head: inner_t head
 logic [7:0] w_data  [var in probe]
 ```
 
@@ -137,6 +143,20 @@ logic [7:0] w_data  [var in probe]
   信号を探し、既存の宣言の直後に `logic` で宣言します。ざっとロジックを書いてから
   まとめて宣言する、という書き方ができます
 - `C-c C-i` (`sv-kit-insert-instance`) … モジュール名を選ぶとインスタンス雛形を挿入
+- `C-c C-h` (`sv-kit-hierarchy`) … モジュールのインスタンス階層をツリー表示します。
+  モジュール名はボタンになっていて、押すと定義箇所へ飛べます。再帰インスタンスや
+  プロジェクト外のモジュールも明示されます
+
+```
+axi_cdc
+  i_axi_cdc_src : axi_cdc_src
+    i_cdc_fifo_gray_src_aw : cdc_fifo_gray_src
+      i_sync : sync
+      i_wptr_b2g : binary_to_gray
+```
+
+`M-x hs-minor-mode` で `begin`/`end`、`case`/`endcase`、`module`/`endmodule` の
+折りたたみもできます（`hideshow` 用の移動関数を登録済みです）。
 
 ## リンタ
 
@@ -287,7 +307,7 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 107 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 113 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして

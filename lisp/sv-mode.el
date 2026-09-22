@@ -327,6 +327,43 @@ you want the new name highlighted right away."
                    (looking-back "^[ \t]*" (line-beginning-position))))
         (indent-according-to-mode)))))
 
+(defconst sv-mode--block-openers
+  '("begin" "case" "casex" "casez" "fork" "generate" "function" "task"
+    "module" "macromodule" "interface" "package" "program" "class")
+  "Keywords that open a block hideshow can fold.")
+
+(defconst sv-mode--block-closers
+  '("end" "endcase" "join" "join_any" "join_none" "endgenerate" "endfunction"
+    "endtask" "endmodule" "endinterface" "endpackage" "endprogram" "endclass")
+  "Keywords that close a foldable block.")
+
+(defconst sv-mode--block-regexp
+  (concat "\\_<" (regexp-opt (append sv-mode--block-openers
+                                   sv-mode--block-closers))
+          "\\_>")
+  "Regexp matching either end of a foldable block.")
+
+(defun sv-mode-forward-block (&optional _argument)
+  "Move past the block that starts at point.
+Used by hideshow, which has no way to know that `end\=' closes `begin\='."
+  (let ((depth 0) (searching t))
+    (while (and searching (re-search-forward sv-mode--block-regexp nil 'move))
+      (unless (sv-mode--in-comment-or-string-p (match-beginning 0))
+        (if (member (match-string-no-properties 0) sv-mode--block-openers)
+            (setq depth (1+ depth))
+          (setq depth (1- depth))
+          (when (<= depth 0) (setq searching nil)))))))
+
+(with-eval-after-load 'hideshow
+  (unless (assq 'sv-mode hs-special-modes-alist)
+    (add-to-list 'hs-special-modes-alist
+                 (list 'sv-mode
+                       (concat "\\_<" (regexp-opt sv-mode--block-openers) "\\_>")
+                       (concat "\\_<" (regexp-opt sv-mode--block-closers) "\\_>")
+                       "/[*/]"
+                       #'sv-mode-forward-block
+                       nil))))
+
 (defconst sv-mode--defun-regexp
   (concat "^[ \t]*\\_<"
           (regexp-opt '("module" "macromodule" "interface" "package" "program"
