@@ -15,6 +15,7 @@ SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 
 | `lisp/sv-index.el` | バッファ／プロジェクトのシンボル索引（ファイル単位でキャッシュ） |
 | `lisp/sv-ide.el` | 補完・定義ジャンプ（xref）・ElDoc |
 | `lisp/sv-refactor.el` | リネーム（構文木ベース、プロジェクト横断） |
+| `lisp/sv-hierarchy.el` | 設計階層ブラウザ（トップ自動判定・遅延展開） |
 | `lisp/sv-kit.el` | Emacs 統合（Flymake / imenu / キーバインド）と CLI |
 | `lisp/sv-mode.el` | メジャーモード。シンタックステーブル・ハイライト・インデント・移動 |
 | `bin/sv-kit` | コマンドライン版（CI 用） |
@@ -90,7 +91,7 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 | `M-.` / `M-?` | `xref-find-definitions` / `-references` | 定義へジャンプ／参照一覧 |
 | `C-M-i` | `completion-at-point` | 文脈を見た補完 |
 | `C-c C-u` | `sv-kit-goto-unit` | ファイル内の design unit へジャンプ |
-| `C-c C-h` | `sv-kit-hierarchy` | インスタンス階層をツリー表示 |
+| `C-c C-h` | `sv-hierarchy` | 設計階層ブラウザを開く |
 | `C-c C-n` | `sv-kit-rename` | カーソル位置の名前をリネーム |
 | `C-c C-t` | `sv-mode-update-user-types` | `typedef` を読み直してハイライトを更新 |
 | `C-M-a` / `C-M-e` | `beginning-of-defun` / `end-of-defun` | module / function 単位で移動 |
@@ -174,20 +175,44 @@ logic [7:0] w_data  [var in probe]
   他ファイルの変更は既定では保存せず modified のまま残すので、差分を確認してから
   保存できます（`sv-refactor-save-after-rename` で変更可）。
 
-- `C-c C-h` (`sv-kit-hierarchy`) … モジュールのインスタンス階層をツリー表示します。
-  モジュール名はボタンになっていて、押すと定義箇所へ飛べます。再帰インスタンスや
-  プロジェクト外のモジュールも明示されます
-
-```
-axi_cdc
-  i_axi_cdc_src : axi_cdc_src
-    i_cdc_fifo_gray_src_aw : cdc_fifo_gray_src
-      i_sync : sync
-      i_wptr_b2g : binary_to_gray
-```
-
 `M-x hs-minor-mode` で `begin`/`end`、`case`/`endcase`、`module`/`endmodule` の
 折りたたみもできます（`hideshow` 用の移動関数を登録済みです）。
+
+## 設計階層ブラウザ
+
+`C-c C-h` (`sv-hierarchy`) で、プロジェクトを読み込んでインスタンス階層を表示します。
+**トップモジュールは自動判定**します（他のどのモジュールからもインスタンス化されて
+いないもの）。引数を訊かれないので、そのまま開けます。
+
+```
++ top_block -- top_block.sv
+```
+
+`TAB` で1段ずつ開きます。
+
+```
+- top_block -- top_block.sv
+  + u_first : sub_block -- sub_block.sv
+  + u_second : sub_block -- sub_block.sv
+```
+
+| キー | 動作 |
+| --- | --- |
+| `TAB` | その行を開く／閉じる |
+| `RET` | **その行のインスタンス記述箇所**へジャンプ |
+| `o` | そのモジュールの**定義**へジャンプ |
+| `c` | そのモジュールを他にどこがインスタンス化しているか表示 |
+| `*` | カーソル位置以下をまとめて展開（`sv-hierarchy-max-depth` まで） |
+| `g` | 設計を読み直して再描画 |
+
+`C-u C-c C-h` でモジュールを選んで、そのサブツリーだけ見ることもできます。
+再帰インスタンスとプロジェクト外のモジュールは `(recursive)` /
+`(not in this project)` と明示して、そこで止まります。
+
+**ツリーは開いた行だけ構築します。** 実設計では同じモジュールが何十箇所にも現れる
+ので、全部を先に描くと巨大かつ低速になります（PULP の axi + common_cells の
+252 ファイル・341 unit で実測: 初回インデックス構築 4.7 秒、ツリー表示 1.5 秒、
+`TAB` 展開 0.1 秒）。
 
 ## リンタ
 
@@ -338,7 +363,7 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 119 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 124 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして

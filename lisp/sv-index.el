@@ -57,7 +57,10 @@ can be rebuilt from them."
   "Maps a file name to (MODIFICATION-TIME TREE SYMBOLS).")
 
 (defvar sv-index--file-lists (make-hash-table :test #'equal)
-  "Maps a project root-directory to (TIMESTAMP . FILES).")
+  "Maps a project root to (TIMESTAMP . FILES).")
+
+(defvar sv-index--projects (make-hash-table :test #'equal)
+  "Maps a project root to (SIGNATURE . INDEX), the assembled index.")
 
 (defvar-local sv-index--buffer-cache nil
   "Cached (TICK TREE SYMBOLS) for this buffer.")
@@ -226,16 +229,19 @@ With FORCE non-nil, scan the directory tree again."
         (puthash root-directory (cons (current-time) files) sv-index--file-lists)
         files))))
 
-(defun sv-index-project (&optional root-directory force)
-  "Return the index of the project under ROOT as a plist.
-`:units' maps a design unit name to its node, `:unit-files' maps it to the
-file it lives in, and `:symbols' maps any name to the symbols that carry
-it.  With FORCE non-nil, rescan the file list as well."
+(defun sv-index--signature (files)
+  "Return a value that changes when any of FILES does."
+  (mapcar (lambda (file)
+            (cons file (file-attribute-modification-time
+                        (file-attributes file))))
+          files))
+
+(defun sv-index--build (files)
+  "Return the index of FILES as a plist."
   (let ((units (make-hash-table :test #'equal))
         (unit-files (make-hash-table :test #'equal))
         (symbols (make-hash-table :test #'equal))
-        (types (make-hash-table :test #'equal))
-        (files (sv-index-project-files root-directory force)))
+        (types (make-hash-table :test #'equal)))
     (dolist (file files)
       (let* ((indexed (sv-index-file file))
              (tree (car indexed)))
@@ -250,6 +256,26 @@ it.  With FORCE non-nil, rescan the file list as well."
           (push symbol (gethash (sv-symbol-name symbol) symbols)))))
     (list :units units :unit-files unit-files :symbols symbols
           :types types :files files)))
+
+(defun sv-index-project (&optional root-directory force)
+  "Return the index of the project under ROOT-DIRECTORY as a plist.
+`:units\=' maps a design unit name to its node, `:unit-files\=' maps it to
+the file it lives in, `:types\=' maps a type name to its typedef, and
+`:symbols\=' maps any name to the symbols that carry it.
+
+The assembled index is cached against the modification times of the
+files it was built from, because the editor services ask for it many
+times per keystroke and rebuilding it each time is what makes them
+feel slow.  With FORCE non-nil, everything is read again."
+  (let* ((root (or root-directory (sv-index-root)))
+         (files (sv-index-project-files root force))
+         (signature (sv-index--signature files))
+         (cached (gethash root sv-index--projects)))
+    (if (and cached (not force) (equal (car cached) signature))
+        (cdr cached)
+      (let ((index (sv-index--build files)))
+        (puthash root (cons signature index) sv-index--projects)
+        index))))
 
 (defun sv-index-unit (name &optional root-directory)
   "Return the design unit called NAME in the project under ROOT."
@@ -310,6 +336,7 @@ it.  With FORCE non-nil, rescan the file list as well."
 (defun sv-index-invalidate (&optional file)
   "Drop the cached index of FILE, or of everything when FILE is nil."
   (interactive)
+  (clrhash sv-index--projects)
   (if file
       (remhash file sv-index--file-cache)
     (clrhash sv-index--file-cache)

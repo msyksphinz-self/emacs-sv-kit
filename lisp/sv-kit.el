@@ -26,7 +26,7 @@
 ;;   C-c C-i   insert an instantiation    `sv-kit-insert-instance'
 ;;   C-c C-p   add the missing ports      `sv-kit-update-instance'
 ;;   C-c C-d   declare missing signals    `sv-kit-declare-missing-signals'
-;;   C-c C-h   show the instance tree     `sv-kit-hierarchy'
+;;   C-c C-h   browse the design tree     `sv-hierarchy'
 ;;   C-c C-n   rename the name at point   `sv-kit-rename'
 ;;   C-c C-u   jump to a design unit      `sv-kit-goto-unit'
 
@@ -42,6 +42,7 @@
 (require 'sv-index)
 (require 'sv-ide)
 (require 'sv-refactor)
+(require 'sv-hierarchy)
 
 (defgroup sv-kit nil
   "SystemVerilog tooling: parser, linter and formatter."
@@ -391,75 +392,6 @@ before the linter complains."
       (forward-line line)
       (line-beginning-position))))
 
-;;;; Design hierarchy
-
-(defcustom sv-kit-hierarchy-max-depth 12
-  "How deep `sv-kit-hierarchy' follows a design before it stops."
-  :type 'integer
-  :group 'sv-kit)
-
-(defun sv-kit--hierarchy-jump (file line)
-  "Return a command that visits LINE of FILE."
-  (lambda (_button)
-    (when file
-      (find-file-other-window file)
-      (goto-char (point-min))
-      (forward-line (1- (or line 1))))))
-
-(defun sv-kit--hierarchy-insert (module depth path)
-  "Write the sub-tree of MODULE at DEPTH, with PATH guarding against cycles."
-  (let* ((unit (sv-index-unit module))
-         (file (sv-index-unit-file module)))
-    (cond
-     ((null unit) (insert "  (not found)\n"))
-     ((member module path) (insert "  (recursive)\n"))
-     ((>= depth sv-kit-hierarchy-max-depth) (insert "  ...\n"))
-     (t
-      (insert "\n")
-      (dolist (instance (sv-parse-collect unit 'instance))
-        (dolist (sibling (plist-get instance :siblings))
-          (insert (make-string (* 2 (1+ depth)) ?\s))
-          (insert (format "%s : " (or (plist-get sibling :name) "?")))
-          (let ((child (plist-get instance :module)))
-            (insert-text-button
-             child
-             'action (sv-kit--hierarchy-jump (sv-index-unit-file child)
-                                             (plist-get (sv-index-unit child) :line))
-             'follow-link t
-             'help-echo (or (sv-index-unit-file child) "not in this project"))
-            (sv-kit--hierarchy-insert child (1+ depth) (cons module path)))))))
-    (ignore file)))
-
-;;;###autoload
-(defun sv-kit-hierarchy (module)
-  "Show the instance tree of MODULE in a buffer, one line per instance.
-Every module name is a button that visits its definition."
-  (interactive
-   (let ((names '()))
-     (maphash (lambda (name unit)
-                (when (memq (plist-get unit :type) '(module interface program))
-                  (push name names)))
-              (plist-get (sv-index-project) :units))
-     (list (completing-read "Hierarchy of module: " (sort names #'string<)
-                            nil t
-                            (let ((unit (sv-ide--enclosing-unit)))
-                              (and unit (plist-get unit :name)))))))
-  (let ((buffer (get-buffer-create "*sv-hierarchy*"))
-        (file (sv-index-unit-file module))
-        (unit (sv-index-unit module)))
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert-text-button module
-                            'action (sv-kit--hierarchy-jump
-                                     file (plist-get unit :line))
-                            'follow-link t
-                            'help-echo (or file ""))
-        (sv-kit--hierarchy-insert module 0 '())
-        (goto-char (point-min)))
-      (special-mode))
-    (display-buffer buffer)))
-
 ;;;; Minor mode
 
 (defvar sv-kit-mode-map
@@ -471,7 +403,7 @@ Every module name is a button that visits its definition."
     (define-key map (kbd "C-c C-p") #'sv-kit-update-instance)
     (define-key map (kbd "C-c C-d") #'sv-kit-declare-missing-signals)
     (define-key map (kbd "C-c C-u") #'sv-kit-goto-unit)
-    (define-key map (kbd "C-c C-h") #'sv-kit-hierarchy)
+    (define-key map (kbd "C-c C-h") #'sv-hierarchy)
     (define-key map (kbd "C-c C-n") #'sv-kit-rename)
     map)
   "Keymap of `sv-kit-mode'.")

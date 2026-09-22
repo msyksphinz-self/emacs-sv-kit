@@ -21,6 +21,7 @@
 (require 'sv-ide)
 (require 'sv-width)
 (require 'sv-refactor)
+(require 'sv-hierarchy)
 
 (defun sv-test-types (text)
   "Return the type of every significant token of TEXT."
@@ -1187,17 +1188,80 @@ OCCURRENCE selects which match to look at, counting from one."
     (sv-test-insert-in-module "  assign x = w_arr[1].head.")
     (should (equal (sv-ide-dotted-prefix (1- (point))) '("w_arr" "head")))))
 
-(ert-deftest sv-kit-shows-the-instance-tree ()
+(defmacro sv-test-with-hierarchy (module &rest body)
+  "Open the tree of MODULE over the fixture project and run BODY in it."
+  (declare (indent 1) (debug t))
+  `(sv-test-with-project
+     (unwind-protect
+         (progn (sv-hierarchy ,module)
+                (with-current-buffer "*sv-hierarchy*"
+                  (goto-char (point-min))
+                  ,@body))
+       (when (get-buffer "*sv-hierarchy*") (kill-buffer "*sv-hierarchy*")))))
+
+(defun sv-test-tree-text ()
+  "Return the text of the tree buffer."
+  (buffer-substring-no-properties (point-min) (point-max)))
+
+(ert-deftest sv-hierarchy-finds-the-top-of-a-design ()
   (sv-test-with-project
-    (unwind-protect
-        (progn
-          (sv-kit-hierarchy "top_block")
-          (with-current-buffer "*sv-hierarchy*"
-            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
-              (should (string-match-p "\\`top_block" text))
-              (should (string-match-p "u_first : sub_block" text))
-              (should (string-match-p "u_second : sub_block" text)))))
-      (when (get-buffer "*sv-hierarchy*") (kill-buffer "*sv-hierarchy*")))))
+    ;; sub_block is instantiated, so only top_block is a top.
+    (should (equal (sv-hierarchy-tops) '("top_block")))))
+
+(ert-deftest sv-hierarchy-opens-closed-and-expands-on-demand ()
+  (sv-test-with-hierarchy nil
+    ;; One line per top, marked as having something under it.
+    (should (equal (string-trim-right (sv-test-tree-text))
+                   (car (split-string (sv-test-tree-text) "\n"))))
+    (should (string-match-p "\\`\\+ top_block" (sv-test-tree-text)))
+    (sv-hierarchy-toggle)
+    (let ((text (sv-test-tree-text)))
+      (should (string-match-p "^- top_block" text))
+      (should (string-match-p "u_first : sub_block" text))
+      (should (string-match-p "u_second : sub_block" text)))
+    ;; And closing it takes them away again.
+    (goto-char (point-min))
+    (sv-hierarchy-toggle)
+    (should (string-match-p "\\`\\+ top_block" (sv-test-tree-text)))
+    (should-not (string-match-p "u_first" (sv-test-tree-text)))))
+
+(ert-deftest sv-hierarchy-remembers-where-everything-is ()
+  (sv-test-with-hierarchy "top_block"
+    (sv-hierarchy-toggle)
+    (forward-line 1)
+    (let ((definition (get-text-property (line-beginning-position)
+                                         'sv-hierarchy-definition))
+          (instantiation (get-text-property (line-beginning-position)
+                                            'sv-hierarchy-instantiation)))
+      (should (equal (file-name-nondirectory (car definition)) "sub_block.sv"))
+      (should (= (cdr definition) 1))
+      (should (equal (file-name-nondirectory (car instantiation))
+                     "top_block.sv"))
+      (should (= (cdr instantiation) 13)))))
+
+(ert-deftest sv-hierarchy-marks-a-leaf-as-having-nothing-under-it ()
+  (sv-test-with-hierarchy "sub_block"
+    (should (string-match-p "\\`  sub_block" (sv-test-tree-text)))
+    (should-not (get-text-property (point-min) 'sv-hierarchy-expandable))))
+
+(ert-deftest sv-hierarchy-expands-a-whole-subtree ()
+  (sv-test-with-hierarchy "top_block"
+    (sv-hierarchy-expand-all)
+    (should (= (length (split-string (string-trim-right (sv-test-tree-text))
+                                     "\n"))
+               3))))
+
+(ert-deftest sv-hierarchy-reports-what-instantiates-a-module ()
+  (sv-test-with-project
+    (let ((sites (sv-hierarchy-callers "sub_block")))
+      (should (= (length sites) 2))
+      (should (cl-every (lambda (site)
+                          (equal (plist-get site :parent) "top_block"))
+                        sites))
+      (should (equal (sort (mapcar (lambda (site) (plist-get site :instance))
+                                   sites)
+                           #'string<)
+                     '("u_first" "u_second"))))))
 
 (ert-deftest sv-mode-moves-over-a-block ()
   (with-temp-buffer
