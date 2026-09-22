@@ -27,6 +27,8 @@
 (require 'sv-parser)
 (require 'sv-index)
 
+(declare-function xref-apropos-regexp "xref" (pattern))
+
 (defgroup sv-ide nil
   "Completion, cross-references and documentation for SystemVerilog."
   :group 'tools
@@ -389,8 +391,17 @@ Suitable as a member of `completion-at-point-functions'."
                        (sv-ide--symbol-location symbol)))
           (sv-ide--definitions identifier)))
 
+(defun sv-ide--apropos-regexp (pattern)
+  "Return the regexp PATTERN stands for.
+`xref-apropos-regexp\=' arrived in Emacs 28; before that a pattern becomes
+a match on its words in order, which is what it does for a multi-word
+pattern anyway."
+  (if (fboundp 'xref-apropos-regexp)
+      (xref-apropos-regexp pattern)
+    (mapconcat #'regexp-quote (split-string pattern "[ \t]+" t) ".*")))
+
 (cl-defmethod xref-backend-apropos ((_backend (eql sv-kit)) pattern)
-  (let ((regexp (xref-apropos-regexp pattern))
+  (let ((regexp (sv-ide--apropos-regexp pattern))
         (results '()))
     (maphash (lambda (name symbols)
                (when (string-match-p regexp name)

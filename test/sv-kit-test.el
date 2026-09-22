@@ -11,6 +11,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'subr-x)
 (require 'sv-lexer)
 (require 'sv-parser)
 (require 'sv-lint)

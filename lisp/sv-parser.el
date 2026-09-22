@@ -23,6 +23,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'sv-lexer)
 
 (defvar sv-parse--toks nil
