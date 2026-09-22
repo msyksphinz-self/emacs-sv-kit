@@ -1,5 +1,7 @@
 # sv-kit — Emacs 向け SystemVerilog パーサ / リンタ / フォーマッタ
 
+[![tests](https://img.shields.io/badge/tests-124-brightgreen)](test/sv-kit-test.el)
+
 SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 → 構文解析 → 構文木**
 を経由して扱う Emacs Lisp パッケージです。同じ構文木の上に、ハイライト・リンタ・
 フォーマッタ・インデント・補完・定義ジャンプ・ElDoc・imenu を載せています。外部ツール
@@ -23,7 +25,7 @@ SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 
 ## インストール
 
 ```elisp
-(add-to-list 'load-path "/path/to/scariv/tools/emacs-sv-kit/lisp")
+(add-to-list 'load-path "/path/to/emacs-sv-kit/lisp")
 (require 'sv-mode)
 ```
 
@@ -382,13 +384,17 @@ $ make check   # byte-compile（警告はエラー扱い）+ ERT 124 テスト
 - フォーマッタはトークン列を 1 つも変えず（意味不変）、冪等性も **全ファイルで成立**
 - lint の指摘は 1939 → 979 件まで精査。`duplicate-declaration` の誤検知は
   スコープ／`` `ifdef `` 分岐を考慮して **0 件** になりました
-- 幅検査は 225 ファイルで 9 件（いずれも実在の切り詰め）。SCARIV の RTL では 0 件
+- 幅検査は 225 ファイルで 9 件（いずれも実在の切り詰め）
 
 この検証で見つかったパーサの不具合（`` `endif `` 直後の `endmodule` の取りこぼし、
 代入パターン `'{...}` の括弧不整合、マクロ文が次の文を飲み込む問題など）は
 すべて修正し、回帰テストを追加してあります。
 
+コーパスは手元で再現できます。
+
 ```console
-$ git submodule update --init --depth 1   # 検証用コーパスを取得
-$ ./bin/sv-kit lint $(find vendor -name '*.sv')
+$ git clone --depth 1 https://github.com/pulp-platform/axi          /tmp/axi
+$ git clone --depth 1 https://github.com/pulp-platform/common_cells /tmp/common_cells
+$ ./bin/sv-kit lint $(find /tmp/axi /tmp/common_cells -name '*.sv')
+$ ./bin/sv-kit format --check $(find /tmp/axi /tmp/common_cells -name '*.sv')
 ```

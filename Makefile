@@ -6,7 +6,9 @@ LISP  = lisp/sv-lexer.el lisp/sv-parser.el lisp/sv-lint.el \
         lisp/sv-format.el lisp/sv-width.el lisp/sv-index.el lisp/sv-ide.el lisp/sv-refactor.el lisp/sv-hierarchy.el \
         lisp/sv-kit.el lisp/sv-mode.el
 TESTS = test/sv-kit-test.el
-RTL  ?= $(shell find ../../common -name '*.sv' 2>/dev/null)
+# Set RTL to the sources you want `make lint' and `make format-check' to
+# read, for example: make lint RTL="$(find ~/design -name '*.sv')"
+RTL  ?=
 
 .PHONY: all check test compile lint format format-check clean help
 
