@@ -1,6 +1,6 @@
 # sv-kit — Emacs 向け SystemVerilog パーサ / リンタ / フォーマッタ
 
-[![tests](https://img.shields.io/badge/tests-124-brightgreen)](test/sv-kit-test.el)
+[![check](https://github.com/msyksphinz-self/emacs-sv-kit/actions/workflows/check.yml/badge.svg)](https://github.com/msyksphinz-self/emacs-sv-kit/actions/workflows/check.yml)
 
 SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 → 構文解析 → 構文木**
 を経由して扱う Emacs Lisp パッケージです。同じ構文木の上に、ハイライト・リンタ・
@@ -362,11 +362,19 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 `make lint` / `make format-check` / `make test` も用意しています
 （`make help` で一覧）。
 
+## ライセンス
+
+Apache License 2.0 です。各ソースに `SPDX-License-Identifier: Apache-2.0` を
+記載しています。
+
 ## 開発
 
 ```console
 $ make check   # byte-compile（警告はエラー扱い）+ ERT 124 テスト
 ```
+
+GitHub Actions で Emacs 27.2 / 28.2 / 29.4 / 30.1 / snapshot に対して
+`make check` を回しています。
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして
 局所的に劣化するだけなので、マクロ多用のコードや書きかけのファイルでも

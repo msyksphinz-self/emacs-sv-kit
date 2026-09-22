@@ -26,7 +26,6 @@
 
 (require 'cl-lib)
 (require 'subr-x)
-(require 'outline)
 (require 'sv-lexer)
 (require 'sv-parser)
 (require 'sv-index)
