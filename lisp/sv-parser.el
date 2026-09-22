@@ -693,6 +693,7 @@ the connection that follows from the parser."
                      (wildcard (equal (sv-token-text name-tok) "*"))
                      (expr (cddr group)))
                 (push (list :name (and (not wildcard) (sv-token-text name-tok))
+                            :name-token (and (not wildcard) name-tok)
                             :wildcard wildcard
                             :positional nil
                             :index index
@@ -931,11 +932,13 @@ the connection that follows from the parser."
   "Parse a design unit of KIND terminated by END-KEYWORD."
   (let ((line (sv-parse--line))
         (beg sv-parse--pos)
-        (name nil) (params nil) (ports nil) (items '()) (end-label nil))
+        (name nil) (name-token nil) (params nil) (ports nil) (items '())
+        (end-label nil) (end-label-token nil))
     (sv-parse--adv)
     (while (sv-parse--at-any '("static" "automatic" "virtual")) (sv-parse--adv))
     (when (eq (sv-parse--type) 'ident)
       (setq name (sv-parse--text))
+      (setq name-token (sv-parse--tok))
       (sv-parse--adv))
     ;; A design unit may import packages between its name and its headers.
     (while (sv-parse--at "import")
@@ -960,9 +963,12 @@ the connection that follows from the parser."
     (sv-parse--accept end-keyword)
     (when (sv-parse--accept ":")
       (setq end-label (sv-parse--text))
+      (setq end-label-token (sv-parse--tok))
       (sv-parse--adv))
-    (list :type kind :name name :params params :ports ports
-          :items (nreverse items) :end-label end-label
+    (list :type kind :name name :name-token name-token
+          :params params :ports ports
+          :items (nreverse items)
+          :end-label end-label :end-label-token end-label-token
           :line line :beg beg :end sv-parse--pos)))
 
 (defconst sv-parse--design-units
@@ -1224,6 +1230,86 @@ other node it holds whatever that subtree declares."
   "Return the names NODE declares, as a list of strings."
   (mapcar (lambda (record) (plist-get record :name))
           (sv-parse-declarations node)))
+
+
+;;;; References
+
+(defun sv-parse-non-reference-tokens (unit declarations)
+  "Return the tokens of UNIT that declare a name rather than use one.
+DECLARATIONS is what `sv-parse-declarations\=' returned for UNIT.  The
+result is a hash holding both token objects and, for the names that have
+no token of their own, their index into the significant-token vector."
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (decl declarations)
+      (when (plist-get decl :token) (puthash (plist-get decl :token) t table)))
+    (dolist (instance (sv-parse-collect unit 'instance))
+      (puthash (plist-get instance :beg) t table))
+    ;; The members of a struct are declarations, not uses of a signal that
+    ;; happens to share their name.
+    (dolist (type '(typedef decl))
+      (dolist (node (sv-parse-collect unit type))
+        (dolist (member (plist-get node :members))
+          (when (plist-get member :token)
+            (puthash (plist-get member :token) t table)))))
+    ;; `modport m (...)' and friends name a scope, not a signal.
+    (dolist (node (sv-parse-collect unit 'other))
+      (when (plist-get node :beg)
+        (puthash (1+ (plist-get node :beg)) t table)))
+    table))
+
+(defun sv-parse-references (unit significant &optional ignored)
+  "Return the identifier references of UNIT as (name . token) pairs.
+SIGNIFICANT is the vector of non-trivia tokens the unit was parsed from.
+IGNORED holds the tokens that declare rather than use a name, as
+`sv-parse-non-reference-tokens\=' computes them; it is worked out here when
+not supplied.
+
+What this leaves out is what tells a reference from a coincidence: a
+field after a dot, a name qualified by a package, the argument of a
+compiler directive, a member of a struct, the label on an assertion and
+the key of an assignment pattern all spell an identifier without reading
+the signal of that name."
+  (let* ((vec significant)
+         (ignored (or ignored
+                      (sv-parse-non-reference-tokens
+                       unit (sv-parse-declarations unit))))
+         (limit (length vec))
+         (beg (or (plist-get unit :beg) 0))
+         (end (min (or (plist-get unit :end) limit) limit))
+         (refs '()))
+    (cl-loop
+     for i from beg below end
+     for tok = (aref vec i)
+     when (and (eq (sv-token-type tok) 'ident)
+               (not (gethash tok ignored))
+               (not (gethash i ignored))
+               (let ((prev (and (> i beg) (aref vec (1- i)))))
+                 ;; `\=`ifdef VERILATOR\=' names a macro, not a signal.
+                 (not (and prev (eq (sv-token-type prev) 'directive))))
+               (let ((prev (and (> i beg) (aref vec (1- i)))))
+                 (not (and prev (member (sv-token-text prev)
+                                        '("." "::" "module" "macromodule"
+                                          "interface" "package" "program"
+                                          "class" "function" "task"
+                                          "endmodule" "endinterface"
+                                          "endpackage" "endprogram" "endclass"
+                                          "endfunction" "endtask")))))
+               (let ((next (and (< (1+ i) end) (aref vec (1+ i)))))
+                 (not (and next (equal (sv-token-text next) "::"))))
+               ;; `check_id : assert ...' labels the statement.
+               (not (and (< (+ i 2) end)
+                         (equal (sv-token-text (aref vec (1+ i))) ":")
+                         (member (sv-token-text (aref vec (+ i 2)))
+                                 '("assert" "assume" "cover" "restrict" "expect"
+                                   "property" "sequence" "always" "always_comb"
+                                   "always_ff" "always_latch" "initial" "final"))))
+               ;; `\='{id: x, len: y}' names members, it does not read them.
+               (not (and (> i beg)
+                         (member (sv-token-text (aref vec (1- i))) '("{" ","))
+                         (< (1+ i) end)
+                         (equal (sv-token-text (aref vec (1+ i))) ":"))))
+     do (push (cons (sv-token-text tok) tok) refs))
+    (nreverse refs)))
 
 
 ;;;; Tree walking

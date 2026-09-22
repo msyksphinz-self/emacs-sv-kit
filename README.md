@@ -14,6 +14,7 @@ SystemVerilog を「正規表現で頑張る」のではなく、**字句解析 
 | `lisp/sv-width.el` | 定数式の畳み込みとビット幅推論 |
 | `lisp/sv-index.el` | バッファ／プロジェクトのシンボル索引（ファイル単位でキャッシュ） |
 | `lisp/sv-ide.el` | 補完・定義ジャンプ（xref）・ElDoc |
+| `lisp/sv-refactor.el` | リネーム（構文木ベース、プロジェクト横断） |
 | `lisp/sv-kit.el` | Emacs 統合（Flymake / imenu / キーバインド）と CLI |
 | `lisp/sv-mode.el` | メジャーモード。シンタックステーブル・ハイライト・インデント・移動 |
 | `bin/sv-kit` | コマンドライン版（CI 用） |
@@ -90,6 +91,7 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 | `C-M-i` | `completion-at-point` | 文脈を見た補完 |
 | `C-c C-u` | `sv-kit-goto-unit` | ファイル内の design unit へジャンプ |
 | `C-c C-h` | `sv-kit-hierarchy` | インスタンス階層をツリー表示 |
+| `C-c C-n` | `sv-kit-rename` | カーソル位置の名前をリネーム |
 | `C-c C-t` | `sv-mode-update-user-types` | `typedef` を読み直してハイライトを更新 |
 | `C-M-a` / `C-M-e` | `beginning-of-defun` / `end-of-defun` | module / function 単位で移動 |
 
@@ -143,6 +145,35 @@ logic [7:0] w_data  [var in probe]
   信号を探し、既存の宣言の直後に `logic` で宣言します。ざっとロジックを書いてから
   まとめて宣言する、という書き方ができます
 - `C-c C-i` (`sv-kit-insert-instance`) … モジュール名を選ぶとインスタンス雛形を挿入
+- `C-c C-n` (`sv-kit-rename`) … カーソル位置の名前をリネームします。**検索置換では
+  なく構文木に基づく**ので、コメント・文字列・同名の構造体メンバは巻き込みません。
+  対象によって範囲が変わります。
+
+  | 対象 | 範囲 |
+  | --- | --- |
+  | 信号・パラメータ・型・インスタンス名 | その design unit 内の宣言と全参照 |
+  | ポート | 上記に加えて、プロジェクト内の全インスタンス記述の `.port` 名（確認あり） |
+  | module / interface / package | プロジェクト内の定義箇所と全インスタンス記述（確認あり） |
+
+  特に効くのは `.sig (sig)` の扱いです。左側は**接続先モジュール**の名前、右側は
+  **このファイル**の信号なので、ローカル信号 `sig` のリネームでは右側だけが変わります。
+
+  ```systemverilog
+  // logic count; を w_total にリネームした結果
+  logic [3:0] w_total;                       // 宣言
+  assign x = w_total + 1;                    // 参照
+  assign y = w_rec.count;                    // 構造体メンバは別物なので不変
+  assign z = "count";                        // 文字列は不変
+  sub u_sub (.count (w_total));              // ポート名は不変、式だけ変わる
+  ```
+
+  同じ名前が 1 つの unit 内の**複数スコープ**で宣言されている場合（別の generate 枝の
+  `localparam` など）は、名前だけではどちらか決められないので中止して行番号を示します。
+  新しい名前が既に使われている場合も中止します。ポート名を変えた後は、崩れた
+  `.port (...)` の桁揃えを自動で直します（`sv-refactor-realign-after-rename`）。
+  他ファイルの変更は既定では保存せず modified のまま残すので、差分を確認してから
+  保存できます（`sv-refactor-save-after-rename` で変更可）。
+
 - `C-c C-h` (`sv-kit-hierarchy`) … モジュールのインスタンス階層をツリー表示します。
   モジュール名はボタンになっていて、押すと定義箇所へ飛べます。再帰インスタンスや
   プロジェクト外のモジュールも明示されます
@@ -307,7 +338,7 @@ $ bin/sv-kit parse           rtl/foo.sv                 # ポート一覧を表�
 ## 開発
 
 ```console
-$ make check   # byte-compile（警告はエラー扱い）+ ERT 113 テスト
+$ make check   # byte-compile（警告はエラー扱い）+ ERT 119 テスト
 ```
 
 パーサは例外を投げません。解釈できない構文は次の `;` や `end` まで読み飛ばして

@@ -27,6 +27,7 @@
 ;;   C-c C-p   add the missing ports      `sv-kit-update-instance'
 ;;   C-c C-d   declare missing signals    `sv-kit-declare-missing-signals'
 ;;   C-c C-h   show the instance tree     `sv-kit-hierarchy'
+;;   C-c C-n   rename the name at point   `sv-kit-rename'
 ;;   C-c C-u   jump to a design unit      `sv-kit-goto-unit'
 
 ;;; Code:
@@ -40,6 +41,7 @@
 (require 'sv-format)
 (require 'sv-index)
 (require 'sv-ide)
+(require 'sv-refactor)
 
 (defgroup sv-kit nil
   "SystemVerilog tooling: parser, linter and formatter."
@@ -63,9 +65,9 @@
   "Return the project root above DIRECTORY, or DIRECTORY itself."
   (sv-index-root directory))
 
-(defun sv-kit-project-files (&optional root)
-  "Return every Verilog source under ROOT."
-  (sv-index-project-files root))
+(defun sv-kit-project-files (&optional root-directory)
+  "Return every Verilog source under ROOT-DIRECTORY."
+  (sv-index-project-files root-directory))
 
 (defun sv-kit-module-table (&optional force)
   "Return the design units of the current project.
@@ -470,6 +472,7 @@ Every module name is a button that visits its definition."
     (define-key map (kbd "C-c C-d") #'sv-kit-declare-missing-signals)
     (define-key map (kbd "C-c C-u") #'sv-kit-goto-unit)
     (define-key map (kbd "C-c C-h") #'sv-kit-hierarchy)
+    (define-key map (kbd "C-c C-n") #'sv-kit-rename)
     map)
   "Keymap of `sv-kit-mode'.")
 

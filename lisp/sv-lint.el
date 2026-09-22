@@ -293,69 +293,6 @@ so those names must count as driven."
 
 ;;;; Reference gathering
 
-(defun sv-lint--ignored-tokens (unit declarations)
-  "Return a hash of tokens that must not count as references inside UNIT.
-Covers declared names themselves and the module name of each instance."
-  (let ((table (make-hash-table :test #'eq)))
-    (dolist (decl declarations)
-      (when (plist-get decl :token) (puthash (plist-get decl :token) t table)))
-    (dolist (instance (sv-parse-collect unit 'instance))
-      (puthash (plist-get instance :beg) t table))
-    ;; The members of a struct are declarations, not uses of a signal that
-    ;; happens to share their name.
-    (dolist (type '(typedef decl))
-      (dolist (node (sv-parse-collect unit type))
-        (dolist (member (plist-get node :members))
-          (when (plist-get member :token)
-            (puthash (plist-get member :token) t table)))))
-    ;; `modport m (...)' and friends name a scope, not a signal.
-    (dolist (node (sv-parse-collect unit 'other))
-      (when (plist-get node :beg)
-        (puthash (1+ (plist-get node :beg)) t table)))
-    table))
-
-(defun sv-lint--references (ctx unit ignored)
-  "Return the identifier references of UNIT as (name . token) pairs.
-IGNORED holds declaration tokens, plus the token index of instance types."
-  (let* ((vec (sv-lint-context-significant ctx))
-         (limit (length vec))
-         (beg (or (plist-get unit :beg) 0))
-         (end (min (or (plist-get unit :end) limit) limit))
-         (refs '()))
-    (cl-loop
-     for i from beg below end
-     for tok = (aref vec i)
-     when (and (eq (sv-token-type tok) 'ident)
-               (not (gethash tok ignored))
-               (not (gethash i ignored))
-               (let ((prev (and (> i beg) (aref vec (1- i)))))
-                 ;; `\=`ifdef VERILATOR\=' names a macro, not a signal.
-                 (not (and prev (eq (sv-token-type prev) 'directive))))
-               (let ((prev (and (> i beg) (aref vec (1- i)))))
-                 (not (and prev (member (sv-token-text prev)
-                                        '("." "::" "module" "macromodule"
-                                          "interface" "package" "program"
-                                          "class" "function" "task"
-                                          "endmodule" "endinterface"
-                                          "endpackage" "endprogram" "endclass"
-                                          "endfunction" "endtask")))))
-               (let ((next (and (< (1+ i) end) (aref vec (1+ i)))))
-                 (not (and next (equal (sv-token-text next) "::"))))
-               ;; `check_id : assert ...' labels the statement.
-               (not (and (< (+ i 2) end)
-                         (equal (sv-token-text (aref vec (1+ i))) ":")
-                         (member (sv-token-text (aref vec (+ i 2)))
-                                 '("assert" "assume" "cover" "restrict" "expect"
-                                   "property" "sequence" "always" "always_comb"
-                                   "always_ff" "always_latch" "initial" "final"))))
-               ;; `\='{id: x, len: y}' names members, it does not read them.
-               (not (and (> i beg)
-                         (member (sv-token-text (aref vec (1- i))) '("'{" "{" ","))
-                         (< (1+ i) end)
-                         (equal (sv-token-text (aref vec (1+ i))) ":"))))
-     do (push (cons (sv-token-text tok) tok) refs))
-    (nreverse refs)))
-
 
 ;;;; Statement analysis helpers
 
@@ -519,8 +456,8 @@ Writing to a signal is not using it, so these occurrences must not keep
 (defun sv-lint--rule-names (ctx unit)
   "Check UNIT for undeclared, unused and duplicated names."
   (let* ((declarations (sv-parse-declarations unit))
-         (ignored (sv-lint--ignored-tokens unit declarations))
-         (references (sv-lint--references ctx unit ignored))
+         (ignored (sv-parse-non-reference-tokens unit declarations))
+         (references (sv-parse-references unit (sv-lint-context-significant ctx) ignored))
          (declared (make-hash-table :test #'equal))
          (used (make-hash-table :test #'equal))
          (file-names (sv-lint-context-modules ctx))

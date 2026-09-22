@@ -33,7 +33,7 @@
   :group 'sv-index)
 
 (defcustom sv-index-root-markers '(".git" "Makefile" "filelist.f")
-  "Files or directories that mark the root of a hardware project."
+  "Files or directories that mark the root-directory of a hardware project."
   :type '(repeat string)
   :group 'sv-index)
 
@@ -57,7 +57,7 @@ can be rebuilt from them."
   "Maps a file name to (MODIFICATION-TIME TREE SYMBOLS).")
 
 (defvar sv-index--file-lists (make-hash-table :test #'equal)
-  "Maps a project root to (TIMESTAMP . FILES).")
+  "Maps a project root-directory to (TIMESTAMP . FILES).")
 
 (defvar-local sv-index--buffer-cache nil
   "Cached (TICK TREE SYMBOLS) for this buffer.")
@@ -207,11 +207,11 @@ is not swallowed by the repository around it."
      (or (car (sort candidates (lambda (a b) (> (length a) (length b)))))
          directory))))
 
-(defun sv-index-project-files (&optional root force)
+(defun sv-index-project-files (&optional root-directory force)
   "Return the Verilog sources under ROOT, caching the listing briefly.
 With FORCE non-nil, scan the directory tree again."
-  (let* ((root (or root (sv-index-root)))
-         (cached (gethash root sv-index--file-lists))
+  (let* ((root-directory (or root-directory (sv-index-root)))
+         (cached (gethash root-directory sv-index--file-lists))
          (fresh (and cached
                      (< (float-time (time-subtract (current-time) (car cached)))
                         sv-index-file-list-ttl))))
@@ -220,13 +220,13 @@ With FORCE non-nil, scan the directory tree again."
       (let* ((regexp (concat "\\.\\(?:"
                              (mapconcat #'regexp-quote sv-index-file-extensions "\\|")
                              "\\)\\'"))
-             (files (ignore-errors (directory-files-recursively root regexp))))
+             (files (ignore-errors (directory-files-recursively root-directory regexp))))
         (when (> (length files) sv-index-max-files)
           (setq files (cl-subseq files 0 sv-index-max-files)))
-        (puthash root (cons (current-time) files) sv-index--file-lists)
+        (puthash root-directory (cons (current-time) files) sv-index--file-lists)
         files))))
 
-(defun sv-index-project (&optional root force)
+(defun sv-index-project (&optional root-directory force)
   "Return the index of the project under ROOT as a plist.
 `:units' maps a design unit name to its node, `:unit-files' maps it to the
 file it lives in, and `:symbols' maps any name to the symbols that carry
@@ -235,7 +235,7 @@ it.  With FORCE non-nil, rescan the file list as well."
         (unit-files (make-hash-table :test #'equal))
         (symbols (make-hash-table :test #'equal))
         (types (make-hash-table :test #'equal))
-        (files (sv-index-project-files root force)))
+        (files (sv-index-project-files root-directory force)))
     (dolist (file files)
       (let* ((indexed (sv-index-file file))
              (tree (car indexed)))
@@ -251,33 +251,33 @@ it.  With FORCE non-nil, rescan the file list as well."
     (list :units units :unit-files unit-files :symbols symbols
           :types types :files files)))
 
-(defun sv-index-unit (name &optional root)
+(defun sv-index-unit (name &optional root-directory)
   "Return the design unit called NAME in the project under ROOT."
-  (gethash name (plist-get (sv-index-project root) :units)))
+  (gethash name (plist-get (sv-index-project root-directory) :units)))
 
-(defun sv-index-unit-file (name &optional root)
+(defun sv-index-unit-file (name &optional root-directory)
   "Return the file that declares the design unit called NAME under ROOT."
-  (gethash name (plist-get (sv-index-project root) :unit-files)))
+  (gethash name (plist-get (sv-index-project root-directory) :unit-files)))
 
-(defun sv-index-type (name &optional root)
+(defun sv-index-type (name &optional root-directory)
   "Return the typedef called NAME in the project under ROOT."
-  (gethash name (plist-get (sv-index-project root) :types)))
+  (gethash name (plist-get (sv-index-project root-directory) :types)))
 
-(defun sv-index-lookup (name &optional root)
+(defun sv-index-lookup (name &optional root-directory)
   "Return the project symbols called NAME under ROOT."
-  (gethash name (plist-get (sv-index-project root) :symbols)))
+  (gethash name (plist-get (sv-index-project root-directory) :symbols)))
 
-(defun sv-index-names (&optional root)
+(defun sv-index-names (&optional root-directory)
   "Return every name the project under ROOT declares."
   (let ((names '()))
     (maphash (lambda (name _) (push name names))
-             (plist-get (sv-index-project root) :symbols))
+             (plist-get (sv-index-project root-directory) :symbols))
     (sort names #'string<)))
 
-(defun sv-index-lint-table (&optional root)
+(defun sv-index-lint-table (&optional root-directory)
   "Return the table the linter uses to check instances across files."
   (let ((table (make-hash-table :test #'equal))
-        (index (sv-index-project root)))
+        (index (sv-index-project root-directory)))
     (maphash (lambda (name unit) (puthash name unit table))
              (plist-get index :units))
     (maphash (lambda (name symbols)
@@ -300,10 +300,10 @@ it.  With FORCE non-nil, rescan the file list as well."
         (push (match-string 1 (sv-token-text token)) names)))
     (nreverse names)))
 
-(defun sv-index-macros (&optional root)
+(defun sv-index-macros (&optional root-directory)
   "Return every macro the project under ROOT defines."
   (let ((names '()))
-    (dolist (file (sv-index-project-files root))
+    (dolist (file (sv-index-project-files root-directory))
       (setq names (append (sv-index-tree-macros (car (sv-index-file file))) names)))
     (sort (delete-dups names) #'string<)))
 

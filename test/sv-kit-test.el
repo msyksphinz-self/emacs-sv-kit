@@ -20,6 +20,7 @@
 (require 'sv-index)
 (require 'sv-ide)
 (require 'sv-width)
+(require 'sv-refactor)
 
 (defun sv-test-types (text)
   "Return the type of every significant token of TEXT."
@@ -1290,6 +1291,137 @@ OCCURRENCE selects which match to look at, counting from one."
     (forward-line 1)
     (should (looking-at-p outline-regexp))
     (should (= (funcall outline-level) 2))))
+
+
+;;;; Renaming
+
+(defmacro sv-test-with-temp-project (&rest body)
+  "Run BODY with a writable copy of the fixture project as the project.
+`sv-test-project-directory\=' holds its path, and every buffer it opened is
+discarded afterwards."
+  (declare (indent 0) (debug t))
+  `(let* ((sv-test-project-directory
+           (file-name-as-directory (make-temp-file "sv-kit-test" t)))
+          (sv-index-root-markers '("filelist.f"))
+          (default-directory sv-test-project-directory)
+          (sv-refactor-save-after-rename t))
+     (dolist (name '("sub_block.sv" "top_block.sv"))
+       (copy-file (expand-file-name name sv-test-fixtures)
+                  (expand-file-name name sv-test-project-directory)))
+     (write-region "" nil (expand-file-name "filelist.f"
+                                            sv-test-project-directory))
+     (sv-index-invalidate)
+     (unwind-protect (progn ,@body)
+       (dolist (buffer (buffer-list))
+         (let ((file (buffer-file-name buffer)))
+           (when (and file (string-prefix-p sv-test-project-directory file))
+             (with-current-buffer buffer (set-buffer-modified-p nil))
+             (kill-buffer buffer))))
+       (delete-directory sv-test-project-directory t)
+       (sv-index-invalidate))))
+
+(defun sv-test-file-contents (path)
+  "Return the contents of PATH."
+  (with-temp-buffer (insert-file-contents path) (buffer-string)))
+
+(defmacro sv-test-answering-yes (&rest body)
+  "Run BODY with every yes-or-no prompt answered yes."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t)))
+     ,@body))
+
+(ert-deftest sv-refactor-renames-a-declaration-and-its-uses ()
+  (sv-test-with-source
+      "module probe;
+         typedef struct packed { logic count; } rec_t;
+         logic [3:0] count;
+         rec_t       w_rec;
+         // count in a comment
+         assign x = count + 1;
+         assign y = w_rec.count;
+         assign z = \"count\";
+         sub u_sub (.count (count));
+       endmodule
+"
+    (search-forward "logic [3:0] count")
+    (backward-char 2)
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+      (sv-kit-rename "w_total"))
+    (let ((text (buffer-string)))
+      ;; The declaration and the plain use moved.
+      (should (string-match-p "logic \\[3:0\\] w_total;" text))
+      (should (string-match-p "assign x = w_total \\+ 1;" text))
+      ;; A comment, a string, a struct member and a port name did not.
+      (should (string-match-p "// count in a comment" text))
+      (should (string-match-p "\"count\"" text))
+      (should (string-match-p "logic count; } rec_t" text))
+      (should (string-match-p "w_rec\\.count" text))
+      ;; In `.count (count)' only the right-hand side is this file's signal.
+      (should (string-match-p "\\.count (w_total)" text)))))
+
+(ert-deftest sv-refactor-refuses-an-ambiguous-name ()
+  (sv-test-with-source
+      "module probe;
+         if (X) begin : a
+           localparam P = 1;
+         end else begin : b
+           localparam P = 2;
+         end
+       endmodule
+"
+    (search-forward "localparam P")
+    (backward-char 1)
+    (let ((error-text (should-error (sv-kit-rename "Q") :type 'user-error)))
+      (should (string-match-p "separate scopes" (format "%s" error-text))))))
+
+(ert-deftest sv-refactor-refuses-a-name-already-taken ()
+  (sv-test-with-source
+      "module probe;\n  logic a;\n  logic b;\n  assign a = b;\nendmodule\n"
+    (search-forward "logic a")
+    (backward-char 1)
+    (should-error (sv-kit-rename "b") :type 'user-error)))
+
+(ert-deftest sv-refactor-refuses-an-unusable-name ()
+  (sv-test-with-source
+      "module probe;\n  logic a;\n  assign x = a;\nendmodule\n"
+    (search-forward "logic a")
+    (backward-char 1)
+    (should-error (sv-kit-rename "module") :type 'user-error)
+    (should-error (sv-kit-rename "2bad") :type 'user-error)))
+
+(ert-deftest sv-refactor-renames-a-port-and-its-connections ()
+  (sv-test-with-temp-project
+    (let ((sub (expand-file-name "sub_block.sv" sv-test-project-directory))
+          (top (expand-file-name "top_block.sv" sv-test-project-directory)))
+      (with-current-buffer (find-file-noselect sub)
+        (goto-char (point-min))
+        (search-forward "i_data")
+        (backward-char 2)
+        (sv-test-answering-yes (sv-kit-rename "i_payload"))
+        (save-buffer))
+      (should (string-match-p "i_payload" (sv-test-file-contents sub)))
+      (let ((text (sv-test-file-contents top)))
+        ;; The connection followed the port.
+        (should (string-match-p "\\.i_payload +(i_data)" text))
+        (should (string-match-p "\\.i_payload +(w_stage)" text))
+        ;; top_block's own port of that name did not move.
+        (should (string-match-p "input  logic \\[W-1:0\\] i_data," text))))))
+
+(ert-deftest sv-refactor-renames-a-design-unit-across-the-project ()
+  (sv-test-with-temp-project
+    (let ((sub (expand-file-name "sub_block.sv" sv-test-project-directory))
+          (top (expand-file-name "top_block.sv" sv-test-project-directory)))
+      (with-current-buffer (find-file-noselect sub)
+        (goto-char (point-min))
+        (search-forward "module sub_block")
+        (backward-char 2)
+        (sv-test-answering-yes (sv-kit-rename "leaf_block"))
+        (save-buffer))
+      (should (string-match-p "module leaf_block" (sv-test-file-contents sub)))
+      (let ((text (sv-test-file-contents top)))
+        (should (string-match-p "leaf_block #(\\.W (W)) u_first" text))
+        (should (string-match-p "leaf_block #(\\.W (W)) u_second" text))
+        (should-not (string-match-p "sub_block" text))))))
 
 (provide 'sv-kit-test)
 
