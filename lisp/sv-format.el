@@ -39,6 +39,19 @@
   :type 'integer
   :group 'sv-format)
 
+(defcustom sv-format-align-assign-continuation t
+  "When non-nil, line a continued assignment up under its right-hand side.
+
+    assign o = sel ? a :
+               b;
+
+Only a line that continues the assignment at its own bracket depth moves;
+one inside parentheses keeps the indentation those parentheses give it,
+and a right-hand side that starts on a line of its own keeps the plain
+`sv-format-continuation-offset'."
+  :type 'boolean
+  :group 'sv-format)
+
 (defcustom sv-format-indent-unit-body t
   "When non-nil, indent the body of a module, interface or package.
 Set it to nil to keep design-unit bodies flush with their header, the
@@ -104,6 +117,11 @@ very long line cannot push a whole block to the right."
   '("if" "for" "while" "foreach" "repeat" "forever" "do" "else"
     "always" "always_comb" "always_ff" "always_latch" "initial" "final")
   "Keywords followed by a sub-statement that gains one indentation level.")
+
+(defconst sv-format--assignment-operators
+  '("=" "<=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "**="
+    "<<=" ">>=" "<<<=" ">>>=")
+  "Operators whose right-hand side a continuation line lines up under.")
 
 (defconst sv-format--no-continuation-operators
   '("." "::" "@" "#" "'" "'{" ":" "++" "--")
@@ -488,11 +506,77 @@ HAD-SPACE says whether the source had whitespace between the two."
                               (substring text column)))))))))
     (mapconcat #'identity (append lines nil) "\n")))
 
+(defun sv-format--continuation-columns (tokens)
+  "Return a hash mapping lines of TOKENS to the column they should line up on.
+A line is listed when it continues an assignment at the assignment\='s own
+bracket depth; the column is where the right-hand side starts.
+
+TOKENS must carry the columns their text really has, so this runs over
+rendered or buffer text, never over source the formatter is about to
+re-render."
+  (let ((columns (make-hash-table :test #'eq))
+        (depth 0)
+        ;; The column the right-hand side starts at, once one has been seen.
+        (target nil)
+        ;; The line the assignment operator itself sits on.
+        (anchor-line nil)
+        ;; An operator has been seen and its right-hand side has not.
+        (awaiting nil)
+        (previous-line nil))
+    (dolist (tok (cl-remove-if #'sv-token-trivia-p tokens))
+      (let* ((text (sv-token-text tok))
+             (line (sv-token-line tok))
+             (first-on-line (not (eq line previous-line))))
+        (when (member text '(")" "]" "}"))
+          (setq depth (max 0 (1- depth))))
+        (cond
+         ;; The token after the operator is what everything lines up under.
+         (awaiting
+          (setq target (sv-token-col tok))
+          (setq awaiting nil))
+         ((and (zerop depth) (null target)
+               (member text sv-format--assignment-operators))
+          (setq awaiting t)
+          (setq anchor-line line))
+         ((and target first-on-line (zerop depth)
+               (not (eq line anchor-line)))
+          (puthash line target columns)))
+        (when (member text '("(" "[" "{"))
+          (setq depth (1+ depth)))
+        ;; A statement, or one element of a declaration list, ends here.
+        (when (and (zerop depth)
+                   (member text '(";" "," "begin" "end")))
+          (setq target nil anchor-line nil awaiting nil))
+        (setq previous-line line)))
+    columns))
+
+(defun sv-format--align-continuations (text)
+  "Return TEXT with continued assignments lined up under their right-hand sides."
+  (if (not sv-format-align-assign-continuation)
+      text
+    (let* ((columns (sv-format--continuation-columns (sv-lex-string text)))
+           (lines (vconcat (split-string text "\n"))))
+      (maphash
+       (lambda (line column)
+         (when (<= line (length lines))
+           (let ((old (aref lines (1- line))))
+             (when (string-match "\\`[ \t]*" old)
+               (aset lines (1- line)
+                     (concat (make-string column ?\s)
+                             (substring old (match-end 0))))))))
+       columns)
+      (mapconcat #'identity (append lines nil) "\n"))))
+
 (defun sv-format--align (text)
   "Align every column family `sv-format-align' asks for inside TEXT."
-  (dolist (kind '(decl-type decl-name case-colon assign-op conn-paren comment))
+  (dolist (kind '(decl-type decl-name case-colon assign-op conn-paren))
     (when (memq kind sv-format-align)
       (setq text (sv-format--align-pass text kind))))
+  ;; A continuation lines up under a column `assign-op' may just have moved,
+  ;; and comments are aligned against the result of that.
+  (setq text (sv-format--align-continuations text))
+  (when (memq 'comment sv-format-align)
+    (setq text (sv-format--align-pass text 'comment)))
   text)
 
 
@@ -577,6 +661,19 @@ of once per line."
           (when (and column (not (looking-at-p "[ \t]*$")))
             (indent-line-to column)))
         (forward-line 1)))
+    ;; The column a continuation lines up on is only known once the lines
+    ;; above it carry their final indentation, so it takes a second look.
+    (when sv-format-align-assign-continuation
+      (let ((columns (sv-format--continuation-columns
+                      (sv-lex (point-min) (point-max)))))
+        (save-excursion
+          (goto-char beg)
+          (beginning-of-line)
+          (while (< (point) end-marker)
+            (let ((column (gethash (line-number-at-pos (point)) columns)))
+              (when (and column (not (looking-at-p "[ \t]*$")))
+                (indent-line-to column)))
+            (forward-line 1)))))
     (set-marker end-marker nil)))
 
 ;;;###autoload
@@ -588,7 +685,12 @@ Suitable as an `indent-line-function'."
          (tokens (sv-lex (point-min) (min (point-max)
                                           (1+ (line-end-position)))))
          (indents (sv-format--indent-table tokens))
-         (column (gethash line indents)))
+         ;; Everything above this line already carries its real columns,
+         ;; so the continuation column can be read off the same lex.
+         (column (or (and sv-format-align-assign-continuation
+                          (gethash line (sv-format--continuation-columns
+                                         tokens)))
+                     (gethash line indents))))
     (when column
       (let ((offset (- (point) (line-beginning-position)))
             (old (current-indentation)))

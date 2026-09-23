@@ -732,6 +732,51 @@ endmodule"))))
   (should (equal (sv-test-format "module m;\nassign x =\ny + z;\nendmodule")
                  "module m;\n  assign x =\n      y + z;\nendmodule")))
 
+(ert-deftest sv-format-aligns-a-continued-assignment ()
+  "A continued assignment lines up under its right-hand side.
+A break after the `:\=' of a conditional counts, even though `:\=' is not a
+continuation operator anywhere else."
+  (should (equal (sv-test-format "module m;
+assign a = sel ? bbb :
+ccc;
+assign e = fff +
+ggg;
+endmodule")
+                 "module m;
+  assign a = sel ? bbb :
+             ccc;
+  assign e = fff +
+             ggg;
+endmodule")))
+
+(ert-deftest sv-format-leaves-a-bracketed-continuation-alone ()
+  "Only a continuation at the assignment's own depth lines up under it.
+Inside parentheses the parentheses decide, and a right-hand side that
+starts on a line of its own has no column to line up under."
+  (should (equal (sv-test-format "module m;
+assign h = (iii +
+jjj);
+assign k =
+lll;
+endmodule")
+                 "module m;
+  assign h = (iii +
+        jjj);
+  assign k =
+      lll;
+endmodule")))
+
+(ert-deftest sv-format-honours-the-continuation-align-option ()
+  (let ((sv-format-align-assign-continuation nil))
+    (should (equal (sv-test-format "module m;
+assign e = fff +
+ggg;
+endmodule")
+                   "module m;
+  assign e = fff +
+      ggg;
+endmodule"))))
+
 (ert-deftest sv-format-honours-the-unit-body-option ()
   (let ((sv-format-indent-unit-body nil))
     (should (equal (sv-test-format "module m;\nlogic x;\nendmodule")
@@ -748,7 +793,8 @@ endmodule"))))
 (ert-deftest sv-format-is-idempotent ()
   (dolist (text (list "module m;\nalways_ff @(posedge c) if (a) x <= 1; else x <= 2;\nendmodule"
                       "module m (input logic a, output logic b);\nassign b = a;\nendmodule"
-                      "module m;\nsub u (\n.a (1),\n.bb (2)\n);\nendmodule"))
+                      "module m;\nsub u (\n.a (1),\n.bb (2)\n);\nendmodule"
+                      "module m;\nassign o = s ? a :\nb;\nassign p = c +\nd;\nendmodule"))
     (let ((once (sv-test-format text)))
       (should (equal once (sv-test-format once))))))
 
