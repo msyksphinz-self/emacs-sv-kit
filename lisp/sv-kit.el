@@ -559,9 +559,14 @@ Reads the sub-command, the options and the file names from `argv'."
             (with-temp-file file (insert formatted))
             (princ (format "%s: formatted\n" file)))
            (diff
+            ;; `call-process' can only write into a buffer, and in batch mode
+            ;; that buffer is not standard output; collect it and print it.
             (let ((temporary (make-temp-file "sv-kit" nil ".sv" formatted)))
-              (call-process "diff" nil t nil "-u" file temporary)
-              (delete-file temporary)))
+              (unwind-protect
+                  (princ (with-temp-buffer
+                           (call-process "diff" nil t nil "-u" file temporary)
+                           (buffer-string)))
+                (delete-file temporary))))
            (t (princ formatted)))))))
     (when (or check write)
       (princ (format "%d of %d file(s) %s\n" changed (length files)
