@@ -707,6 +707,52 @@ endmodule")
   );
 endmodule")))
 
+(ert-deftest sv-format-aligns-across-blank-lines-and-comments ()
+  "A blank line or a comment does not end a column group.
+A port list written in paragraphs is still one list, and lining its
+paragraphs up separately is what a reader notices."
+  (should (equal (sv-test-format "module m
+(
+input logic i_clk,
+
+// requests
+input logic [3:0] i_req,
+output logic o_ack
+);
+endmodule")
+                 "module m
+  (
+    input  logic       i_clk,
+
+    // requests
+    input  logic [3:0] i_req,
+    output logic       o_ack
+  );
+endmodule")))
+
+(ert-deftest sv-format-ends-a-column-group-at-code ()
+  "Anything other than a blank line or a comment still ends a group.
+These two declarations belong to different parts of the module and must
+not be lined up with each other."
+  (should (equal (sv-test-format "module m;
+logic a;
+
+always_comb begin
+x = 1;
+end
+
+logic bbbb;
+endmodule")
+                 "module m;
+  logic a;
+
+  always_comb begin
+    x = 1;
+  end
+
+  logic bbbb;
+endmodule")))
+
 (ert-deftest sv-format-respects-the-alignment-spread-limit ()
   (let ((sv-format-align-max-spread 2))
     (should (equal (sv-test-format "module m;

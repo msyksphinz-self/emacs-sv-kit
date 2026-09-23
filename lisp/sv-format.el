@@ -465,30 +465,57 @@ HAD-SPACE says whether the source had whitespace between the two."
     (comment (sv-format--comment-anchor tokens))
     (t nil)))
 
+(defun sv-format--code-lines (tokens)
+  "Return a hash of the lines of TOKENS that carry something besides comments.
+Every other line is blank or nothing but comment, which a column family
+reads over rather than treating as the end of a group."
+  (let ((code (make-hash-table :test #'eq)))
+    (dolist (tok tokens)
+      (unless (sv-token-trivia-p tok)
+        ;; A string or a macro call can span lines; all of them carry code.
+        (let ((line (sv-token-line tok))
+              (breaks (cl-count ?\n (sv-token-text tok))))
+          (dotimes (offset (1+ breaks))
+            (puthash (+ line offset) t code)))))
+    code))
+
 (defun sv-format--align-pass (text kind)
   "Return TEXT with the KIND anchors of consecutive similar lines aligned."
   (let* ((tokens (sv-lex-string text))
          (lines (vconcat (split-string text "\n")))
+         (code (sv-format--code-lines tokens))
          (groups '())
          (current '()))
-    (cl-flet ((flush ()
-                (when (> (length current) 1)
-                  (push (nreverse current) groups))
-                (setq current '())))
+    (cl-flet* ((flush ()
+                 (when (> (length current) 1)
+                   (push (nreverse current) groups))
+                 (setq current '()))
+               ;; Blank lines and comments separate lines that belong
+               ;; together -- the paragraphs of a port list, say -- so only
+               ;; a line carrying code ends a group.
+               (broken-p (previous line)
+                 (let ((between (1+ previous))
+                       (broken nil))
+                   (while (and (not broken) (< between line))
+                     (when (gethash between code) (setq broken t))
+                     (setq between (1+ between)))
+                   broken)))
       (dolist (entry (sv-format--line-tokens tokens))
         (let* ((line (car entry))
                (anchor (sv-format--anchor kind (cdr entry)))
                (indent (and anchor
                             (string-match "\\`[ \t]*" (aref lines (1- line)))
                             (match-end 0))))
-          (if (null anchor)
-              (flush)
+          (cond
+           ((not (gethash line code)) nil)
+           ((null anchor) (flush))
+           (t
             (let ((previous (car current)))
               (when (and previous
-                         (or (/= (nth 0 previous) (1- line))
+                         (or (broken-p (nth 0 previous) line)
                              (/= (nth 2 previous) indent)))
                 (flush))
-              (push (list line (sv-token-col anchor) indent) current)))))
+              (push (list line (sv-token-col anchor) indent) current))))))
       (flush))
     (dolist (group groups)
       (let* ((columns (mapcar #'cl-second group))
