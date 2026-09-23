@@ -425,13 +425,17 @@ before the linter complains."
   (if sv-kit-mode
       (progn
         (when sv-kit-use-indent-function
-          (setq-local indent-line-function #'sv-format-indent-line))
+          (setq-local indent-line-function #'sv-format-indent-line)
+          ;; `sv-format-buffer' only ever emits spaces and the linter
+          ;; reports tabs, so the indent command must not insert them.
+          (setq-local indent-tabs-mode nil))
         (setq-local imenu-create-index-function #'sv-kit-imenu-index)
         (add-hook 'flymake-diagnostic-functions #'sv-kit-flymake-backend nil t)
         (sv-ide-setup)
         (add-hook 'before-save-hook #'sv-kit--maybe-format nil t)
         (when (bound-and-true-p flymake-mode) (flymake-start)))
     (kill-local-variable 'indent-line-function)
+    (kill-local-variable 'indent-tabs-mode)
     (kill-local-variable 'imenu-create-index-function)
     (remove-hook 'flymake-diagnostic-functions #'sv-kit-flymake-backend t)
     (sv-ide-teardown)
