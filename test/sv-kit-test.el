@@ -589,6 +589,38 @@ endmodule")
   end
 endmodule")))
 
+(ert-deftest sv-format-indents-an-else-if-chain ()
+  "`end else if (...) begin\=' must not lose a level.
+The `if\=' hanging off the `else\=' pushes a dangling frame, and the `begin\='
+that follows has to inherit that frame's column, not the column of the
+block below it."
+  (should (equal (sv-test-format "module m;
+always_comb begin
+if (a) begin
+x = 1;
+end else if (b) begin
+x = 2;
+end else if (c) begin
+x = 3;
+end else begin
+x = 4;
+end
+end
+endmodule")
+                 "module m;
+  always_comb begin
+    if (a) begin
+      x = 1;
+    end else if (b) begin
+      x = 2;
+    end else if (c) begin
+      x = 3;
+    end else begin
+      x = 4;
+    end
+  end
+endmodule")))
+
 (ert-deftest sv-format-indents-a-hanging-statement ()
   (should (equal (sv-test-format "module m;
 always_comb

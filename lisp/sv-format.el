@@ -166,10 +166,12 @@ RECENT holds the spellings of the tokens just seen, most recent first."
    ((equal text "begin")
     (let* ((below (sv-format--pop-danglings stack))
            ;; A `begin' takes over the level its dangling statement had.
+           ;; The frames just popped are the dangling ones; the deepest of
+           ;; them sits at index (- (length stack) (length below) 1), which
+           ;; `last' reaches with (1+ (length below)) elements.
            (open (if (eq below stack)
                      column
-                   (plist-get (car (last stack (1+ (- (length stack)
-                                                      (length below)))))
+                   (plist-get (car (last stack (1+ (length below))))
                               :open))))
       (cons (sv-format--frame 'begin (min column (or open column))) below)))
    ((member text '("case" "casex" "casez" "randcase"))
