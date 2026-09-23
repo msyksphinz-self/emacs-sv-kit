@@ -744,7 +744,7 @@ whose condition cannot be folded might not be, so neither is analysed."
                  (let* ((tokens (plist-get item :cond))
                         (inside (if (and tokens
                                          (equal (sv-token-text (car tokens)) "("))
-                                    (butlast (cdr tokens))
+                                    (sv-parse-unwrap tokens)
                                   tokens))
                         (value (sv-width-eval inside widths)))
                    (cond ((null value) nil)

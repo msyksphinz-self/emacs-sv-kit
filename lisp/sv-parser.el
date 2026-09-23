@@ -115,6 +115,28 @@ Includes both delimiters.  Returns nil when not sitting on an opener."
           (when (<= depth 0) (setq done t))))
       (nreverse acc))))
 
+(defun sv-parse--balanced-p (tokens)
+  "Return non-nil when every bracket TOKENS opens is also closed in TOKENS."
+  (let ((depth 0))
+    (dolist (tok tokens)
+      (let ((text (sv-token-text tok)))
+        (cond ((member text '("(" "[" "{")) (setq depth (1+ depth)))
+              ((member text '(")" "]" "}")) (setq depth (1- depth))))))
+    (zerop depth)))
+
+(defun sv-parse-unwrap (tokens)
+  "Return TOKENS without the brackets wrapping them.
+The closing bracket is dropped only when the source really has one.  A
+group the buffer cuts off mid-way keeps every token it holds, so a
+truncated instance or port list does not silently lose its last name."
+  (if (sv-parse--balanced-p tokens)
+      (butlast (cdr tokens))
+    (cdr tokens)))
+
+(defun sv-parse--inside-balanced ()
+  "Consume a bracketed group at point and return the tokens inside it."
+  (sv-parse-unwrap (sv-parse--skip-balanced)))
+
 (defconst sv-parse--line-directives
   '("`ifdef" "`ifndef" "`elsif" "`undef" "`include" "`timescale" "`line"
     "`default_nettype" "`pragma" "`begin_keywords" "`end_keywords"
@@ -689,7 +711,12 @@ the connection that follows from the parser."
       (setq group (sv-parse--strip-leading-directives group))
       (when group
         (let ((first (car group)))
-          (if (equal (sv-token-text first) ".")
+          (cond
+           ;; A `.' with nothing after it is a connection being typed, not a
+           ;; positional one.  Reporting it would make the linter fire on a
+           ;; half-written line.
+           ((and (equal (sv-token-text first) ".") (null (cdr group))) nil)
+           ((equal (sv-token-text first) ".")
               (let* ((name-tok (cadr group))
                      (wildcard (equal (sv-token-text name-tok) "*"))
                      (expr (cddr group)))
@@ -699,18 +726,19 @@ the connection that follows from the parser."
                             :positional nil
                             :index index
                             :expr (if (and expr (equal (sv-token-text (car expr)) "("))
-                                      (butlast (cdr expr))
+                                      (sv-parse-unwrap expr)
                                     expr)
                             :implicit (null expr)
                             :line (sv-token-line first)
                             :col (sv-token-col first)
                             :token first)
-                      connections))
+                      connections)))
+           (t
             (push (list :name nil :positional t :index index :expr group
                         :line (sv-token-line first)
                         :col (sv-token-col first)
                         :token first)
-                  connections))))
+                  connections)))))
       (setq index (1+ index)))
     (nreverse connections)))
 
@@ -726,7 +754,7 @@ the connection that follows from the parser."
       (sv-parse--adv 2))
     (when (sv-parse--accept "#")
       (setq params (sv-parse--connections
-                    (butlast (cdr (sv-parse--skip-balanced))))))
+                    (sv-parse--inside-balanced))))
     (let ((instances '()))
       (while (and (not (sv-parse--eob-p)) (not (sv-parse--at ";")))
         (if (eq (sv-parse--type) 'ident)
@@ -736,7 +764,7 @@ the connection that follows from the parser."
               (while (sv-parse--at "[") (sv-parse--skip-balanced))
               (let ((conn (when (sv-parse--at "(")
                             (sv-parse--connections
-                             (butlast (cdr (sv-parse--skip-balanced)))))))
+                             (sv-parse--inside-balanced)))))
                 (push (list :name name :line name-line :connections conn)
                       instances)))
           (sv-parse--adv)))
@@ -761,7 +789,7 @@ the connection that follows from the parser."
                  (and tok (sv-token-text tok))))
          (body '()))
     (when (sv-parse--at "(")
-      (setq args (sv-parse--port-list (butlast (cdr (sv-parse--skip-balanced))))))
+      (setq args (sv-parse--port-list (sv-parse--inside-balanced))))
     ;; A prototype (`extern', `pure virtual') has no body.
     (if (cl-some (lambda (tok) (member (sv-token-text tok) '("extern" "pure")))
                  header)
@@ -809,7 +837,7 @@ the connection that follows from the parser."
         (when (sv-parse--accept "@")
           (if (sv-parse--at "(")
               (let ((group (sv-parse--skip-balanced)))
-                (setq sensitivity (butlast (cdr group)))
+                (setq sensitivity (sv-parse-unwrap group))
                 (setq star (or (null sensitivity)
                                (and (= (length sensitivity) 1)
                                     (equal (sv-token-text (car sensitivity)) "*")))))
@@ -953,9 +981,9 @@ the connection that follows from the parser."
       (sv-parse--adv)
       (when (sv-parse--at "(")
         (setq params (sv-parse--param-list
-                      (butlast (cdr (sv-parse--skip-balanced)))))))
+                      (sv-parse--inside-balanced)))))
     (when (sv-parse--at "(")
-      (setq ports (sv-parse--port-list (butlast (cdr (sv-parse--skip-balanced))))))
+      (setq ports (sv-parse--port-list (sv-parse--inside-balanced))))
     ;; `extends'/`implements' clauses of a class, import lists of a package.
     (sv-parse--collect-until '(";"))
     (sv-parse--accept ";")
