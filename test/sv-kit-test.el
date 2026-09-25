@@ -1637,6 +1637,39 @@ discarded afterwards."
         (should (string-match-p "leaf_block #(\\.W (W)) u_second" text))
         (should-not (string-match-p "sub_block" text))))))
 
+(ert-deftest sv-parser-survives-a-truncated-connection-list ()
+  "A buffer cut off inside an instance must not signal: it is being typed."
+  (dolist (text '("module m;\n  sub u_sub (\n    .c"
+                  "module m;\n  sub u_sub (.a (b), .c"
+                  "module m;\n  sub u_sub (\n    ."
+                  "module m;\n  sub u_sub (\n    .c ("
+                  "module m;\n  sub u_sub ("))
+    (should (sv-parse-string text))))
+
+(ert-deftest sv-parser-keeps-the-last-name-of-a-truncated-group ()
+  "An unterminated group has no closing bracket to drop, so nothing is lost."
+  (let* ((unit (sv-test-unit "module m;\n  sub u_sub (\n    .c"))
+         (inst (car (plist-get unit :items)))
+         (conns (plist-get inst :connections)))
+    (should (equal (plist-get inst :module) "sub"))
+    (should (equal (mapcar (lambda (c) (plist-get c :name)) conns) '("c")))))
+
+(ert-deftest sv-parser-ignores-a-connection-that-is-only-a-dot ()
+  "A bare `.' is a connection being typed, not a positional one."
+  (let* ((unit (sv-test-unit "module m;\n  sub u_sub (.a (b), ."))
+         (inst (car (plist-get unit :items)))
+         (conns (plist-get inst :connections)))
+    (should (equal (mapcar (lambda (c) (plist-get c :name)) conns) '("a")))
+    (should-not (cl-some (lambda (c) (plist-get c :positional)) conns))))
+
+(ert-deftest sv-parse-unwrap-drops-only-a-bracket-that-is-there ()
+  (should (equal (mapcar #'sv-token-text
+                         (sv-parse-unwrap (append (sv-lex-significant (sv-lex-string "(a + b)")) nil)))
+                 '("a" "+" "b")))
+  (should (equal (mapcar #'sv-token-text
+                         (sv-parse-unwrap (append (sv-lex-significant (sv-lex-string "(a + b")) nil)))
+                 '("a" "+" "b"))))
+
 (provide 'sv-kit-test)
 
 ;;; sv-kit-test.el ends here
