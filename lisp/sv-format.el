@@ -535,46 +535,59 @@ reads over rather than treating as the end of a group."
 
 (defun sv-format--continuation-columns (tokens)
   "Return a hash mapping lines of TOKENS to the column they should line up on.
-A line is listed when it continues an assignment at the assignment\='s own
-bracket depth; the column is where the right-hand side starts.
+
+Two things put a line in the hash.  Inside a bracket whose opening token
+is followed by something on the same line, the contents line up under
+that something.  At statement level, a continued assignment lines up
+under its right-hand side.  A bracket that ends its line, and a
+right-hand side that starts on a line of its own, offer no column to
+line up under, so their contents keep the indentation they were given.
 
 TOKENS must carry the columns their text really has, so this runs over
 rendered or buffer text, never over source the formatter is about to
 re-render."
-  (let ((columns (make-hash-table :test #'eq))
-        (depth 0)
-        ;; The column the right-hand side starts at, once one has been seen.
-        (target nil)
-        ;; The line the assignment operator itself sits on.
-        (anchor-line nil)
-        ;; An operator has been seen and its right-hand side has not.
-        (awaiting nil)
-        (previous-line nil))
-    (dolist (tok (cl-remove-if #'sv-token-trivia-p tokens))
-      (let* ((text (sv-token-text tok))
-             (line (sv-token-line tok))
-             (first-on-line (not (eq line previous-line))))
-        (when (member text '(")" "]" "}"))
-          (setq depth (max 0 (1- depth))))
-        (cond
-         ;; The token after the operator is what everything lines up under.
-         (awaiting
-          (setq target (sv-token-col tok))
-          (setq awaiting nil))
-         ((and (zerop depth) (null target)
-               (member text sv-format--assignment-operators))
-          (setq awaiting t)
-          (setq anchor-line line))
-         ((and target first-on-line (zerop depth)
-               (not (eq line anchor-line)))
-          (puthash line target columns)))
-        (when (member text '("(" "[" "{"))
-          (setq depth (1+ depth)))
-        ;; A statement, or one element of a declaration list, ends here.
-        (when (and (zerop depth)
-                   (member text '(";" "," "begin" "end")))
-          (setq target nil anchor-line nil awaiting nil))
-        (setq previous-line line)))
+  (let* ((significant (vconcat (cl-remove-if #'sv-token-trivia-p tokens)))
+         (count (length significant))
+         (columns (make-hash-table :test #'eq))
+         ;; Innermost first.  Each frame is the column its contents line up
+         ;; on, or nil when they keep the indentation they were given.
+         (frames '())
+         ;; The same, for the statement the brackets sit in.
+         (statement nil)
+         (previous-line nil))
+    (cl-flet ((following-column (index line)
+                ;; The token after INDEX, when it shares LINE and is not the
+                ;; bracket closing again straight away.
+                (let ((next (and (< (1+ index) count)
+                                 (aref significant (1+ index)))))
+                  (and next
+                       (eq (sv-token-line next) line)
+                       (not (member (sv-token-text next) '(")" "]" "}")))
+                       (sv-token-col next)))))
+      (dotimes (index count)
+        (let* ((tok (aref significant index))
+               (text (sv-token-text tok))
+               (line (sv-token-line tok))
+               (first-on-line (not (eq line previous-line)))
+               (closer (member text '(")" "]" "}"))))
+          ;; A closing bracket belongs to the frame it ends, not to that
+          ;; frame's contents, so it leaves before the line is weighed.
+          (when closer
+            (setq frames (cdr frames)))
+          (when (and first-on-line (not closer))
+            (let ((target (if frames (car frames) statement)))
+              (when target
+                (puthash line target columns))))
+          (when (and (null frames) (null statement)
+                     (member text sv-format--assignment-operators))
+            (setq statement (following-column index line)))
+          (when (member text '("(" "[" "{"))
+            (push (following-column index line) frames))
+          ;; A statement, or one element of a declaration list, ends here.
+          (when (and (null frames)
+                     (member text '(";" "," "begin" "end")))
+            (setq statement nil))
+          (setq previous-line line))))
     columns))
 
 (defun sv-format--align-continuations (text)

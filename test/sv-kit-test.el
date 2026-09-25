@@ -795,19 +795,44 @@ endmodule")
              ggg;
 endmodule")))
 
-(ert-deftest sv-format-leaves-a-bracketed-continuation-alone ()
-  "Only a continuation at the assignment's own depth lines up under it.
-Inside parentheses the parentheses decide, and a right-hand side that
-starts on a line of its own has no column to line up under."
+(ert-deftest sv-format-lines-bracket-contents-up-under-the-bracket ()
+  "Contents line up under whatever follows the bracket on its line."
   (should (equal (sv-test-format "module m;
-assign h = (iii +
-jjj);
+assign a = {p[3:0],
+q[2:0],
+r[1]};
+assign b = foo(xx,
+yy);
+endmodule")
+                 "module m;
+  assign a = {p[3:0],
+              q[2:0],
+              r[1]};
+  assign b = foo(xx,
+                 yy);
+endmodule")))
+
+(ert-deftest sv-format-offsets-contents-of-a-bracket-that-ends-its-line ()
+  "A bracket with nothing after it offers no column to line up under.
+Its contents fall back to `sv-format-indent-offset', which is what an
+instance port list written one connection per line relies on."
+  (should (equal (sv-test-format "module m;
+assign c = {
+p,
+q};
+sub u (
+.a (1),
+.bb (2));
 assign k =
 lll;
 endmodule")
                  "module m;
-  assign h = (iii +
-        jjj);
+  assign c = {
+    p,
+    q};
+  sub u (
+    .a  (1),
+    .bb (2));
   assign k =
       lll;
 endmodule")))
