@@ -226,6 +226,24 @@ STACK is the frame stack and PREVIOUS the last significant token."
                   (not (memq (sv-format--kind (car stack))
                              '(paren bracket brace))))))))
 
+(defun sv-format--comment-positions (tokens)
+  "Return a hash mapping a count of significant TOKENS to comment-only lines.
+The key is how many significant tokens precede the comment, which is what
+`sv-format--indent-table' needs to know which block the comment sits in."
+  (let ((code-lines (make-hash-table :test #'eq))
+        (positions (make-hash-table :test #'eq))
+        (seen 0))
+    (dolist (tok tokens)
+      (unless (sv-token-trivia-p tok)
+        (puthash (sv-token-line tok) t code-lines)))
+    (dolist (tok tokens)
+      (cond
+       ((not (sv-token-trivia-p tok)) (setq seen (1+ seen)))
+       ((and (memq (sv-token-type tok) '(comment attribute))
+             (not (gethash (sv-token-line tok) code-lines)))
+        (cl-pushnew (sv-token-line tok) (gethash seen positions)))))
+    positions))
+
 (defun sv-format--indent-table (tokens)
   "Return a hash mapping each line of TOKENS to the column it should start at."
   (let* ((significant (vconcat (cl-remove-if #'sv-token-trivia-p tokens)))
@@ -238,7 +256,12 @@ STACK is the frame stack and PREVIOUS the last significant token."
          (previous nil)
          (recent '())
          (column 0)
-         (current-line -1))
+         (current-line -1)
+         (comment-positions (sv-format--comment-positions tokens))
+         (comment-blocks (make-hash-table :test #'eq)))
+    ;; A comment before the first token of all is at the outermost level.
+    (dolist (comment (gethash 0 comment-positions))
+      (puthash comment 0 comment-blocks))
     (dotimes (index count)
       (let* ((tok (aref significant index))
              (text (sv-token-text tok))
@@ -299,26 +322,37 @@ STACK is the frame stack and PREVIOUS the last significant token."
             (while (and open-ifs (>= (cdar open-ifs) depth))
               (pop open-ifs))))
         (setq previous tok)
-        (setq recent (cons text (cl-subseq recent 0 (min 3 (length recent)))))))
-    (sv-format--fill-comment-indents tokens indents)
+        (setq recent (cons text (cl-subseq recent 0 (min 3 (length recent)))))
+        ;; Any comment standing between this token and the next sits in
+        ;; whichever block is open right here.
+        (dolist (comment (gethash (1+ index) comment-positions))
+          (puthash comment (if stack (plist-get (car stack) :indent) 0)
+                   comment-blocks))))
+    (sv-format--fill-comment-indents tokens indents comment-blocks)
     indents))
 
-(defun sv-format--fill-comment-indents (tokens indents)
+(defun sv-format--fill-comment-indents (tokens indents comment-blocks)
   "Give every comment-only line of TOKENS an entry in INDENTS.
-A comment takes the deeper of the code around it, so that it stays with
-the block it documents."
+COMMENT-BLOCKS holds the indentation of the block each comment sits in,
+and a comment takes that, or the code below it where that goes deeper --
+which is how a comment introducing a block joins the block it describes.
+
+The code *above* deliberately has no say: the line above may be the tail
+of a multi-line statement, and the column a continuation was given is
+not a level anything can be nested at."
   (let ((code-lines (sort (hash-table-keys indents) #'<))
         (comment-lines '()))
     (dolist (tok tokens)
       (when (and (memq (sv-token-type tok) '(comment attribute))
                  (not (gethash (sv-token-line tok) indents)))
-        (push (sv-token-line tok) comment-lines)))
+        (cl-pushnew (sv-token-line tok) comment-lines)))
     (dolist (line (nreverse comment-lines))
-      (let ((before 0) (after nil))
+      (let ((after nil))
         (dolist (code code-lines)
-          (cond ((< code line) (setq before (gethash code indents)))
-                ((and (> code line) (null after)) (setq after (gethash code indents)))))
-        (puthash line (max before (or after 0)) indents)))))
+          (when (and (> code line) (null after))
+            (setq after (gethash code indents))))
+        (puthash line (max (gethash line comment-blocks 0) (or after 0))
+                 indents)))))
 
 
 ;;;; Rendering

@@ -774,6 +774,40 @@ endmodule"))))
   (should (equal (sv-test-format "module m;\n\n// note\nlogic x;\nendmodule")
                  "module m;\n\n  // note\n  logic x;\nendmodule")))
 
+(ert-deftest sv-format-keeps-a-comment-out-of-a-continuation ()
+  "A comment sits in its block, not at the column a continuation was given.
+The line above it here is the tail of a multi-line statement, and that
+column is not a level anything nests at."
+  (should (equal (sv-test-format "module m;
+assign x = (a |
+b);
+// note
+endmodule")
+                 "module m;
+  assign x = (a |
+              b);
+  // note
+endmodule")))
+
+(ert-deftest sv-format-lets-a-comment-join-the-block-below-it ()
+  "Where the code below goes deeper, an introducing comment follows it."
+  (should (equal (sv-test-format "module m;
+// documents the block
+always_comb begin
+// documents the body
+x = 1;
+// still the body
+end
+endmodule")
+                 "module m;
+  // documents the block
+  always_comb begin
+    // documents the body
+    x = 1;
+    // still the body
+  end
+endmodule")))
+
 (ert-deftest sv-format-indents-a-continuation-line ()
   (should (equal (sv-test-format "module m;\nassign x =\ny + z;\nendmodule")
                  "module m;\n  assign x =\n      y + z;\nendmodule")))
