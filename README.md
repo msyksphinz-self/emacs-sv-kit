@@ -95,6 +95,7 @@ font-lock はパーサではなく正規表現で行うので入力中でも軽�
 | `C-c C-u` | `sv-kit-goto-unit` | ファイル内の design unit へジャンプ |
 | `C-c C-h` | `sv-hierarchy` | 設計階層ブラウザを開く |
 | `C-c C-n` | `sv-kit-rename` | カーソル位置の名前をリネーム |
+| `C-c C-a` | `sv-kit-align-instance-ports` | インスタンスの `(` と `)` を揃える |
 | `C-c C-t` | `sv-mode-update-user-types` | `typedef` を読み直してハイライトを更新 |
 | `C-M-a` / `C-M-e` | `beginning-of-defun` / `end-of-defun` | module / function 単位で移動 |
 
@@ -140,6 +141,23 @@ logic [7:0] w_data  [var in probe]
 ```
 
 ## 便利なコマンド
+
+- `C-c C-a` (`sv-kit-align-instance-ports`) … カーソル位置のインスタンスの接続を、
+  `(` だけでなく `)` の桁も揃えます。パラメータ上書き `#(...)` も同時に揃います
+
+  ```systemverilog
+  verilog_test #(
+    .NUM (NUM)
+  ) u_verilog_test (
+    .i_clk   (i_clk  ),
+    .i_rst_n (i_rst_n),
+    .a_in    (a_in   ),
+    .c_out   (c_out  )
+  );
+  ```
+
+  `)` の桁揃えは括弧の内側に空白を入れるので、フォーマッタは既定では行いません。
+  `C-c C-f` を掛けても残したい場合は `(add-to-list 'sv-format-align 'conn-close)`
 
 - `C-c C-p` (`sv-kit-update-instance`) … カーソル位置のインスタンスに、モジュール
   定義にあって未接続のポートを `.port (port)` の形で追加します。定義に無いポートを
@@ -346,6 +364,7 @@ sub u_sub (
 (setq sv-format-continuation-offset 4)  ; 継続行の追加インデント
 (setq sv-format-indent-unit-body nil)   ; module 直下を字下げしない（本リポジトリの既存スタイル）
 (setq sv-format-align '(decl-name assign-op))  ; 揃える対象を絞る。nil で桁揃えなし
+(add-to-list 'sv-format-align 'conn-close)     ; .port (sig) の ) も揃える（既定では無効）
 (setq sv-format-directive-column 'code) ; `ifdef を 0 桁固定にせずコードとして扱う
 ```
 

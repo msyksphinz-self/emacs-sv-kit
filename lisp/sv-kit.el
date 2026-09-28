@@ -303,6 +303,59 @@ filled in for you."
                 (setq found context))))
           found))))
 
+(defun sv-kit--instance-start (open)
+  "Return where the instantiation whose port list opens at OPEN begins.
+That is the module name, stepping back over the instance name, an
+instance array and a parameter override, whichever are there."
+  (save-excursion
+    (goto-char open)
+    (skip-chars-backward " \t\n")
+    ;; An instance array sits between the name and its ports.
+    (when (eq (char-before) ?\])
+      (ignore-errors (backward-sexp))
+      (skip-chars-backward " \t\n"))
+    (skip-syntax-backward "w_")
+    (skip-chars-backward " \t\n")
+    ;; A parameter override sits between the module and the instance name.
+    (when (eq (char-before) ?\))
+      (ignore-errors (backward-sexp))
+      (skip-chars-backward " \t\n")
+      (when (eq (char-before) ?#) (backward-char 1))
+      (skip-chars-backward " \t\n"))
+    (skip-syntax-backward "w_")
+    (point)))
+
+;;;###autoload
+(defun sv-kit-align-instance-ports ()
+  "Line up the parentheses of the connections in the instantiation at point.
+Both of them: every `.port (signal)\=' gets its `(\=' on one column and the
+`)\=' that closes it on another, over the port list and the parameter
+override alike.
+
+    .i_clk   (i_clk  ),
+    .i_rst_n (i_rst_n),
+
+The formatter leaves the closing parenthesis where it falls unless
+`conn-close\=' is in `sv-format-align\=', so this is how to ask for it one
+instantiation at a time.  Add the symbol to that list to have
+`sv-format-buffer\=' keep it that way."
+  (interactive)
+  (let* ((context (or (sv-kit--instance-context)
+                      (user-error "Point is not on a module instantiation")))
+         (open (plist-get context :open))
+         (close (or (plist-get context :close)
+                    (user-error "The port list of `%s\=' is never closed"
+                                (plist-get context :instance))))
+         (sv-format-align (append sv-format-align '(conn-paren conn-close))))
+    (save-excursion
+      (let ((start (progn (goto-char (sv-kit--instance-start open))
+                          (line-beginning-position))))
+        (goto-char close)
+        (sv-format-region start (line-end-position))))
+    (message "%s: lined up %d connection(s)"
+             (plist-get context :instance)
+             (length (plist-get context :connected)))))
+
 ;;;###autoload
 (defun sv-kit-update-instance ()
   "Add the ports the instantiation at point leaves out.
@@ -405,6 +458,7 @@ before the linter complains."
     (define-key map (kbd "C-c C-u") #'sv-kit-goto-unit)
     (define-key map (kbd "C-c C-h") #'sv-hierarchy)
     (define-key map (kbd "C-c C-n") #'sv-kit-rename)
+    (define-key map (kbd "C-c C-a") #'sv-kit-align-instance-ports)
     map)
   "Keymap of `sv-kit-mode'.")
 

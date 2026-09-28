@@ -753,6 +753,40 @@ endmodule")
   logic bbbb;
 endmodule")))
 
+(ert-deftest sv-format-aligns-connection-parentheses ()
+  "`conn-close' lines the closing parenthesis up as `conn-paren' does the
+opening one.  It is off by default, so the test asks for it."
+  (let ((sv-format-align (append sv-format-align '(conn-close))))
+    (should (equal (sv-test-format "module test;
+sub u (
+.i_clk (i_clk),
+.i_rst_n (i_rst_n),
+.a_in (a_in)
+);
+endmodule")
+                   "module test;
+  sub u (
+    .i_clk   (i_clk  ),
+    .i_rst_n (i_rst_n),
+    .a_in    (a_in   )
+  );
+endmodule"))))
+
+(ert-deftest sv-format-leaves-connection-parentheses-alone-by-default ()
+  "Padding inside the parentheses is opt-in."
+  (should (equal (sv-test-format "module test;
+sub u (
+.i_clk (i_clk),
+.i_rst_n (i_rst_n)
+);
+endmodule")
+                 "module test;
+  sub u (
+    .i_clk   (i_clk),
+    .i_rst_n (i_rst_n)
+  );
+endmodule")))
+
 (ert-deftest sv-format-respects-the-alignment-spread-limit ()
   (let ((sv-format-align-max-spread 2))
     (should (equal (sv-test-format "module m;
@@ -1468,6 +1502,21 @@ OCCURRENCE selects which match to look at, counting from one."
       (goto-char (point-min))
       (search-forward "u_sub")
       (sv-kit-update-instance)
+      (should (equal before (buffer-string))))))
+
+(ert-deftest sv-kit-aligns-the-parentheses-of-an-instance ()
+  (sv-test-with-source
+      "module probe;\n  sub_block u_sub (\n.i_clk (clk),\n.i_data (w_long_name),\n.o_data (q)\n);\nendmodule\n"
+    (search-forward "i_data")
+    (sv-kit-align-instance-ports)
+    (should (string-match-p "\\.i_clk  (clk        )," (buffer-string)))
+    (should (string-match-p "\\.i_data (w_long_name)," (buffer-string)))
+    (should (string-match-p "\\.o_data (q          )" (buffer-string)))
+    ;; Running it again changes nothing.
+    (let ((before (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "i_data")
+      (sv-kit-align-instance-ports)
       (should (equal before (buffer-string))))))
 
 (ert-deftest sv-kit-declares-the-signals-a-module-assigns ()

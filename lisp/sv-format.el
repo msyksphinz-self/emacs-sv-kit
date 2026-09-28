@@ -72,10 +72,16 @@ like ordinary statements."
 `decl-type' lines up the data type of ports after their direction,
 `decl-name' lines up declared names after their data type, `case-colon'
 lines up the colon of case arms, `assign-op' lines up `=' and `<=',
-`conn-paren' lines up the parenthesis of instance port connections, and
-`comment' lines up trailing comments."
+`conn-paren' lines up the opening parenthesis of instance port
+connections, `conn-close' lines up the one that closes them, and
+`comment' lines up trailing comments.
+
+`conn-close' is the one family not on by default: it pads inside the
+parentheses, which not every code base wants.  `sv-kit-align-instance-
+ports' turns it on for a single instantiation."
   :type '(set (const decl-type) (const decl-name) (const case-colon)
-              (const assign-op) (const conn-paren) (const comment))
+              (const assign-op) (const conn-paren) (const conn-close)
+              (const comment))
   :group 'sv-format)
 
 (defcustom sv-format-align-max-spread 40
@@ -479,6 +485,25 @@ HAD-SPACE says whether the source had whitespace between the two."
       (let ((position (sv-parse-find-top (cddr significant) '("("))))
         (when position (nth position (cddr significant)))))))
 
+(defun sv-format--connection-close-anchor (tokens)
+  "Return the parenthesis that closes a `.port (signal)' connection.
+Nil when the connection does not close on the line it opened on, there
+being no column to line up then."
+  (let* ((significant (cl-remove-if #'sv-token-trivia-p tokens))
+         (open (sv-format--connection-anchor tokens))
+         (depth 0)
+         (close nil))
+    (when open
+      (dolist (tok significant)
+        (unless close
+          (cond
+           ((and (zerop depth) (not (eq tok open))) nil)
+           ((equal (sv-token-text tok) "(") (setq depth (1+ depth)))
+           ((equal (sv-token-text tok) ")")
+            (setq depth (1- depth))
+            (when (zerop depth) (setq close tok)))))))
+    close))
+
 (defun sv-format--comment-anchor (tokens)
   "Return a trailing comment token of TOKENS, when the line has code first."
   (let ((code nil) (comment nil))
@@ -496,6 +521,7 @@ HAD-SPACE says whether the source had whitespace between the two."
     (case-colon (sv-format--case-colon-anchor tokens))
     (assign-op (sv-format--assign-anchor tokens))
     (conn-paren (sv-format--connection-anchor tokens))
+    (conn-close (sv-format--connection-close-anchor tokens))
     (comment (sv-format--comment-anchor tokens))
     (t nil)))
 
@@ -643,7 +669,8 @@ re-render."
 
 (defun sv-format--align (text)
   "Align every column family `sv-format-align' asks for inside TEXT."
-  (dolist (kind '(decl-type decl-name case-colon assign-op conn-paren))
+  (dolist (kind '(decl-type decl-name case-colon assign-op conn-paren
+                            conn-close))
     (when (memq kind sv-format-align)
       (setq text (sv-format--align-pass text kind))))
   ;; A continuation lines up under a column `assign-op' may just have moved,
