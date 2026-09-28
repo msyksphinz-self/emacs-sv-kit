@@ -210,9 +210,47 @@ is not swallowed by the repository around it."
      (or (car (sort candidates (lambda (a b) (> (length a) (length b)))))
          directory))))
 
+(defun sv-index--root-marked-p (directory)
+  "Return non-nil when DIRECTORY itself holds one of `sv-index-root-markers'."
+  (cl-some (lambda (marker)
+             (file-exists-p (expand-file-name marker directory)))
+           sv-index-root-markers))
+
+(defun sv-index--scan-tree (root-directory regexp limit)
+  "Return up to about LIMIT files under ROOT-DIRECTORY matching REGEXP.
+Unlike `directory-files-recursively', a directory that cannot be read is
+skipped rather than aborting the walk, and hidden directories are not
+entered at all -- `.git' or a container store under `.local' would
+otherwise dominate the scan.  Symbolic links are never followed.  The
+walk is breadth-first so that when LIMIT cuts it short, the files
+nearest the root are the ones that survive."
+  (let ((level (list (directory-file-name (expand-file-name root-directory))))
+        (files '())
+        (count 0))
+    (while (and level (< count limit))
+      (let ((next '()))
+        (dolist (directory level)
+          (when (< count limit)
+            (dolist (entry (condition-case nil
+                               (directory-files-and-attributes
+                                directory t "\\`[^.]")
+                             (file-error nil)))
+              (if (eq (file-attribute-type (cdr entry)) t)
+                  (push (car entry) next)
+                (when (string-match-p regexp (car entry))
+                  (push (car entry) files)
+                  (setq count (1+ count)))))))
+        (setq level (nreverse next))))
+    (nreverse files)))
+
 (defun sv-index-project-files (&optional root-directory force)
   "Return the Verilog sources under ROOT, caching the listing briefly.
-With FORCE non-nil, scan the directory tree again."
+The tree is walked only when ROOT looks like a project, that is when it
+holds one of `sv-index-root-markers'.  Anywhere else -- typically a file
+opened straight in $HOME -- only the files sitting in ROOT itself are
+returned, because recursing through an arbitrary directory can churn a
+whole network filesystem before the first buffer is shown.  With FORCE
+non-nil, scan the directory tree again."
   (let* ((root-directory (or root-directory (sv-index-root)))
          (cached (gethash root-directory sv-index--file-lists))
          (fresh (and cached
@@ -223,7 +261,12 @@ With FORCE non-nil, scan the directory tree again."
       (let* ((regexp (concat "\\.\\(?:"
                              (mapconcat #'regexp-quote sv-index-file-extensions "\\|")
                              "\\)\\'"))
-             (files (ignore-errors (directory-files-recursively root-directory regexp))))
+             (files (if (sv-index--root-marked-p root-directory)
+                        (sv-index--scan-tree root-directory regexp
+                                             sv-index-max-files)
+                      (condition-case nil
+                          (directory-files root-directory t regexp)
+                        (file-error nil)))))
         (when (> (length files) sv-index-max-files)
           (setq files (cl-subseq files 0 sv-index-max-files)))
         (puthash root-directory (cons (current-time) files) sv-index--file-lists)
