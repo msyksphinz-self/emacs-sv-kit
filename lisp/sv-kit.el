@@ -79,10 +79,28 @@ FORCE only asks for the list of files to be scanned again."
 
 ;;;; Linting
 
-(defun sv-kit-diagnostics (&optional buffer)
-  "Return the lint findings of BUFFER, the current one by default."
+(defun sv-kit-diagnostics (&optional buffer wait)
+  "Return the lint findings of BUFFER, the current one by default.
+The checks that reach across files need the project index, which can
+take a while the first time in a large design.  Until it exists the
+buffer is linted on its own -- the cross-file rules quietly skip
+modules they cannot see -- while the index is built in the background,
+and Flymake runs again once it is ready.  With WAIT non-nil, and always
+in batch where no timer would ever fire, the index is instead built on
+the spot, however long that takes."
   (with-current-buffer (or buffer (current-buffer))
-    (sv-lint-buffer nil (sv-kit-module-table))))
+    (if (or wait noninteractive (sv-index-project-ready-p))
+        (sv-lint-buffer nil (sv-kit-module-table))
+      (sv-index-build-in-background nil #'sv-kit--lint-when-indexed)
+      (sv-lint-buffer))))
+
+(defun sv-kit--lint-when-indexed (_index)
+  "Lint every `sv-kit-mode' buffer again, now that the project index exists."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and (bound-and-true-p sv-kit-mode)
+                 (bound-and-true-p flymake-mode))
+        (flymake-start)))))
 
 ;;;###autoload
 (defun sv-kit-lint (&optional buffer)
@@ -90,7 +108,7 @@ FORCE only asks for the list of files to be scanned again."
   (interactive)
   (let* ((buffer (or buffer (current-buffer)))
          (name (or (buffer-file-name buffer) (buffer-name buffer)))
-         (diagnostics (sv-kit-diagnostics buffer))
+         (diagnostics (sv-kit-diagnostics buffer t))
          (output (get-buffer-create "*sv-lint*")))
     (with-current-buffer output
       (let ((inhibit-read-only t))

@@ -286,38 +286,46 @@ TYPED is the port name being edited, which stays on offer."
 ;;;###autoload
 (defun sv-ide-completion-at-point ()
   "Complete the SystemVerilog name before point.
-Suitable as a member of `completion-at-point-functions'."
-  (let* ((bounds (sv-ide--symbol-bounds))
+Suitable as a member of `completion-at-point-functions'.  Until the
+project index has been built, the candidates come from this buffer
+alone and the index is requested in the background, so the first
+completion in a large design does not freeze the session.  In batch,
+where no timer would ever build the index, it is built on the spot."
+  (let* ((ready (or noninteractive (sv-index-project-ready-p)))
+         (bounds (sv-ide--symbol-bounds))
          (start (car bounds))
          (end (cdr bounds))
          (after-dot (eq (char-before start) ?.))
          (after-quote (eq (char-before start) ?`))
          (system-task (eq (char-after start) ?$))
-         (context (and after-dot (sv-ide-instance-context start)))
+         (context (and after-dot ready (sv-ide-instance-context start)))
          (pair
           (cond
            (context (sv-ide--port-candidates
                      context (buffer-substring-no-properties start end)))
            (after-quote
-            (cons (sv-index-macros) (make-hash-table :test #'equal)))
-           (after-dot (sv-ide--field-candidates
-                       (sv-ide-dotted-prefix (1- start))))
+            (cons (and ready (sv-index-macros))
+                  (make-hash-table :test #'equal)))
+           ((and after-dot ready)
+            (sv-ide--field-candidates (sv-ide-dotted-prefix (1- start))))
            (system-task
             (cons sv-ide-system-tasks (make-hash-table :test #'equal)))
-           (t
+           ((not after-dot)
             (let* ((local (sv-ide--candidates-from-symbols (sv-ide--scope-symbols)))
                    (candidates (car local))
                    (annotations (cdr local)))
-              (dolist (name (sv-index-names))
-                (unless (gethash name annotations)
-                  (puthash name " project" annotations)
-                  (push name candidates)))
+              (when ready
+                (dolist (name (sv-index-names))
+                  (unless (gethash name annotations)
+                    (puthash name " project" annotations)
+                    (push name candidates))))
               (when sv-ide-complete-keywords
                 (dolist (keyword sv-lexer-keywords)
                   (unless (gethash keyword annotations)
                     (puthash keyword " keyword" annotations)
                     (push keyword candidates))))
               (cons (nreverse candidates) annotations))))))
+    (unless ready (sv-index-build-in-background))
     (when pair
       (list start end (car pair)
             :exclusive 'no
@@ -504,15 +512,22 @@ FILE names the file the buffer holds."
 
 ;;;###autoload
 (defun sv-ide-eldoc-function (callback &rest _ignored)
-  "Report the declaration of the name at point to CALLBACK."
-  (let ((documentation (ignore-errors (sv-ide-documentation-at-point))))
-    (when documentation
-      (funcall callback documentation)
-      documentation)))
+  "Report the declaration of the name at point to CALLBACK.
+ElDoc fires on every pause of point, so it must never be the call that
+blocks on indexing a large project; it stays quiet until the index has
+been built in the background and simply starts answering then."
+  (if (or noninteractive (sv-index-project-ready-p))
+      (let ((documentation (ignore-errors (sv-ide-documentation-at-point))))
+        (when documentation
+          (funcall callback documentation)
+          documentation))
+    (sv-index-build-in-background)
+    nil))
 
 (defun sv-ide-eldoc-legacy ()
   "Return the declaration of the name at point, for Emacs 27's ElDoc."
-  (ignore-errors (sv-ide-documentation-at-point)))
+  (when (or noninteractive (sv-index-project-ready-p))
+    (ignore-errors (sv-ide-documentation-at-point))))
 
 ;;;###autoload
 (defun sv-ide-setup ()

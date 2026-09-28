@@ -216,6 +216,39 @@ is not swallowed by the repository around it."
              (file-exists-p (expand-file-name marker directory)))
            sv-index-root-markers))
 
+(defun sv-index--git-files (root-directory regexp limit)
+  "Return up to LIMIT files under ROOT-DIRECTORY that git knows about.
+Asking git reads the repository's index in milliseconds where walking a
+large tree over NFS takes half a minute, so this is tried before
+`sv-index--scan-tree'.  Tracked files come from the checkout and its
+submodules, untracked ones from the top checkout alone, and files that
+`.gitignore' hides -- usually build products -- are left out.  Return
+nil when ROOT-DIRECTORY is not a git checkout or git is missing or
+fails, so the caller walks the tree instead."
+  (when (and (file-exists-p (expand-file-name ".git" root-directory))
+             (executable-find "git"))
+    (with-temp-buffer
+      (let ((default-directory (file-name-as-directory root-directory)))
+        (when (and (or (eql 0 (ignore-errors
+                                (call-process "git" nil '(t nil) nil "ls-files"
+                                              "-z" "--recurse-submodules")))
+                       ;; An old git cannot recurse into submodules; the
+                       ;; top checkout alone still beats walking the tree.
+                       (progn (erase-buffer)
+                              (eql 0 (ignore-errors
+                                       (call-process "git" nil '(t nil) nil
+                                                     "ls-files" "-z")))))
+                   (eql 0 (ignore-errors
+                            (call-process "git" nil '(t nil) nil "ls-files"
+                                          "-z" "--others"
+                                          "--exclude-standard"))))
+          (let ((files '()) (count 0))
+            (dolist (name (split-string (buffer-string) "\0" t))
+              (when (and (< count limit) (string-match-p regexp name))
+                (push (expand-file-name name root-directory) files)
+                (setq count (1+ count))))
+            (nreverse files)))))))
+
 (defun sv-index--scan-tree (root-directory regexp limit)
   "Return up to about LIMIT files under ROOT-DIRECTORY matching REGEXP.
 Unlike `directory-files-recursively', a directory that cannot be read is
@@ -262,8 +295,10 @@ non-nil, scan the directory tree again."
                              (mapconcat #'regexp-quote sv-index-file-extensions "\\|")
                              "\\)\\'"))
              (files (if (sv-index--root-marked-p root-directory)
-                        (sv-index--scan-tree root-directory regexp
-                                             sv-index-max-files)
+                        (or (sv-index--git-files root-directory regexp
+                                                 sv-index-max-files)
+                            (sv-index--scan-tree root-directory regexp
+                                                 sv-index-max-files))
                       (condition-case nil
                           (directory-files root-directory t regexp)
                         (file-error nil)))))
@@ -319,6 +354,64 @@ feel slow.  With FORCE non-nil, everything is read again."
       (let ((index (sv-index--build files)))
         (puthash root (cons signature index) sv-index--projects)
         index))))
+
+(defvar sv-index--build-state nil
+  "State of the background build: (ROOT CALLBACKS FILES).
+FILES is the work still to parse, or the symbol `list' before the
+project has even been listed.")
+
+(defvar sv-index--build-timer nil
+  "Timer driving `sv-index--build-step' while a background build runs.")
+
+(defun sv-index-project-ready-p (&optional root-directory)
+  "Return non-nil once the project under ROOT-DIRECTORY has an index.
+It may be stale, but `sv-index-project' revalidates that cheaply; what
+readiness promises is that the expensive first parse of every source
+file is already behind us."
+  (and (gethash (or root-directory (sv-index-root)) sv-index--projects) t))
+
+(defun sv-index-build-in-background (&optional root-directory callback)
+  "Build the first index of the project under ROOT-DIRECTORY off the keyboard.
+A timer lists the project and then parses a few files per tick, backing
+off whenever input arrives, so a large design indexes itself while the
+buffer stays usable.  CALLBACK, when non-nil, receives the index once it
+is complete; when the index already exists it is called right away, and
+a call made while a build is running just adds its callback to it."
+  (let ((root (or root-directory (sv-index-root))))
+    (cond
+     ((sv-index-project-ready-p root)
+      (when callback (funcall callback (sv-index-project root))))
+     (sv-index--build-state
+      (when callback (push callback (nth 1 sv-index--build-state))))
+     (t
+      (setq sv-index--build-state
+            (list root (and callback (list callback)) 'list))
+      (setq sv-index--build-timer
+            (run-with-timer 0.1 0.1 #'sv-index--build-step))))))
+
+(defun sv-index--build-step ()
+  "Advance the background build by one bounded slice of work."
+  (pcase-let ((`(,root ,callbacks ,files) sv-index--build-state))
+    (cond
+     ((eq files 'list)
+      (setf (nth 2 sv-index--build-state) (sv-index-project-files root)))
+     (files
+      ;; Parse a handful of files, dropping the slice the moment the
+      ;; user types; whatever is left waits for the next tick.
+      (let ((budget 25))
+        (while (and files (> budget 0)
+                    (eq 'done (while-no-input (sv-index-file (car files))
+                                              'done)))
+          (setq files (cdr files))
+          (setq budget (1- budget))))
+      (setf (nth 2 sv-index--build-state) files))
+     (t
+      (cancel-timer sv-index--build-timer)
+      (setq sv-index--build-timer nil)
+      (setq sv-index--build-state nil)
+      (let ((index (sv-index-project root)))
+        (dolist (callback (nreverse callbacks))
+          (funcall callback index)))))))
 
 (defun sv-index-unit (name &optional root-directory)
   "Return the design unit called NAME in the project under ROOT."
