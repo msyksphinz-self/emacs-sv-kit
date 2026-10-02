@@ -148,28 +148,41 @@ the spot, however long that takes."
     (display-buffer output)
     (message "%d finding(s) in %d file(s)" total (length files))))
 
-(defun sv-kit--diagnostic-region (diagnostic)
-  "Return the buffer region DIAGNOSTIC covers, as a cons of positions."
+(defun sv-kit--diagnostic-regions (diagnostics)
+  "Return the buffer region each of DIAGNOSTICS covers, as conses of positions.
+DIAGNOSTICS must be ordered by line, which is how `sv-lint-buffer'
+returns them: the buffer is then walked just once, where looking every
+line up from the top would read a large buffer over again per finding."
   (save-excursion
     (goto-char (point-min))
-    (forward-line (1- (sv-diagnostic-line diagnostic)))
-    (let* ((start (min (point-max) (+ (point) (sv-diagnostic-col diagnostic))))
-           (end (save-excursion
-                  (goto-char start)
-                  (if (re-search-forward "[A-Za-z0-9_$]+\\|.\\|\n"
-                                         (line-end-position) t)
-                      (match-end 0)
-                    (min (point-max) (1+ start))))))
-      (cons start (max end (1+ start))))))
+    (let ((line 1))
+      (mapcar
+       (lambda (diagnostic)
+         (forward-line (- (sv-diagnostic-line diagnostic) line))
+         (setq line (sv-diagnostic-line diagnostic))
+         (let* ((start (min (point-max)
+                            (+ (point) (sv-diagnostic-col diagnostic))))
+                (end (save-excursion
+                       (goto-char start)
+                       (if (re-search-forward "[A-Za-z0-9_$]+\\|.\\|\n"
+                                              (line-end-position) t)
+                           (match-end 0)
+                         (min (point-max) (1+ start))))))
+           (cons start (max end (1+ start)))))
+       diagnostics))))
 
 (defun sv-kit-flymake-backend (report-fn &rest _args)
-  "Report the SystemVerilog lint findings of this buffer to REPORT-FN."
-  (let ((buffer (current-buffer)))
-    (funcall
-     report-fn
-     (mapcar
-      (lambda (diagnostic)
-        (let ((region (sv-kit--diagnostic-region diagnostic)))
+  "Report the SystemVerilog lint findings of this buffer to REPORT-FN.
+A buffer larger than `sv-index-max-file-size' reports no findings;
+linting one would hold the session for minutes."
+  (if (sv-index-buffer-large-p)
+      (funcall report-fn nil)
+    (let* ((buffer (current-buffer))
+           (diagnostics (sv-kit-diagnostics buffer)))
+      (funcall
+       report-fn
+       (cl-mapcar
+        (lambda (diagnostic region)
           (flymake-make-diagnostic
            buffer (car region) (cdr region)
            (cl-case (sv-diagnostic-severity diagnostic)
@@ -178,8 +191,8 @@ the spot, however long that takes."
              (t :note))
            (format "%s [%s]"
                    (sv-diagnostic-message diagnostic)
-                   (sv-diagnostic-rule diagnostic)))))
-      (sv-kit-diagnostics buffer)))))
+                   (sv-diagnostic-rule diagnostic))))
+        diagnostics (sv-kit--diagnostic-regions diagnostics))))))
 
 
 ;;;; Navigation and templates
@@ -193,8 +206,11 @@ the spot, however long that takes."
       (point-min))))
 
 (defun sv-kit-imenu-index ()
-  "Build an imenu index of the design units in this buffer."
-  (let* ((tree (sv-parse-buffer))
+  "Build an imenu index of the design units in this buffer.
+The parse tree comes from `sv-index-buffer', so it is shared with
+completion and ElDoc, and a buffer too large to parse yields an empty
+index instead of a frozen session."
+  (let* ((tree (car (sv-index-buffer)))
          (units '()) (instances '()) (blocks '()) (routines '()))
     (dolist (unit (plist-get tree :units))
       (push (cons (format "%s %s" (plist-get unit :type)
@@ -496,7 +512,10 @@ before the linter complains."
   :group 'sv-kit
   (if sv-kit-mode
       (progn
-        (when sv-kit-use-indent-function
+        ;; Indenting a line lexes the buffer up to it, which a buffer
+        ;; over `sv-index-max-file-size' cannot afford on every TAB.
+        (when (and sv-kit-use-indent-function
+                   (not (sv-index-buffer-large-p)))
           (setq-local indent-line-function #'sv-format-indent-line)
           ;; `sv-format-buffer' only ever emits spaces and the linter
           ;; reports tabs, so the indent command must not insert them.

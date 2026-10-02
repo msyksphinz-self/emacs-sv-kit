@@ -24,6 +24,7 @@
 (require 'sv-lexer)
 (require 'sv-parser)
 (require 'sv-format)
+(require 'sv-index)
 (require 'sv-kit)
 
 (defgroup sv-mode nil
@@ -285,9 +286,12 @@ otherwise clobber the search position they rely on."
   "Collect the types and enumeration literals this buffer declares.
 They are then highlighted like built-in ones.  This runs when the mode
 starts and after each save; call it by hand after adding a `typedef' if
-you want the new name highlighted right away."
+you want the new name highlighted right away.  A buffer larger than
+`sv-index-max-file-size' is left alone: parsing it would freeze the
+session for as long as the parse takes."
   (interactive)
-  (when sv-mode-highlight-user-types
+  (when (and sv-mode-highlight-user-types
+             (not (sv-index-buffer-large-p)))
     (let ((types '()) (literals '()))
       (condition-case nil
           (let ((tree (sv-parse-buffer)))
@@ -423,8 +427,9 @@ own parser, so no external Verilog package or tool is needed.
   (setq-local comment-start-skip "\\(?://+\\|/\\*+\\)[ \t]*")
   (setq-local comment-multi-line t)
   (setq-local parse-sexp-ignore-comments t)
-  (setq-local indent-line-function #'sv-format-indent-line)
-  (setq-local indent-region-function #'sv-format-indent-region)
+  (unless (sv-index-buffer-large-p)
+    (setq-local indent-line-function #'sv-format-indent-line)
+    (setq-local indent-region-function #'sv-format-indent-region))
   (setq-local electric-indent-chars
               (append '(?\; ?\) ?\}) electric-indent-chars))
   (setq-local outline-regexp
@@ -444,8 +449,17 @@ own parser, so no external Verilog package or tool is needed.
   (add-hook 'after-save-hook #'sv-mode-update-user-types nil t)
   (sv-kit-mode 1)
   (sv-mode-update-user-types)
-  (when (and sv-mode-enable-flymake (not noninteractive))
-    (flymake-mode 1)))
+  (if (sv-index-buffer-large-p)
+      ;; Keyword highlighting still works; everything that would read
+      ;; the whole buffer -- the lint pass, the parser-driven services,
+      ;; the index -- stays off so the file opens in seconds, not
+      ;; minutes.
+      (unless noninteractive
+        (message "sv-mode: %s is larger than `sv-index-max-file-size'; %s"
+                 (buffer-name)
+                 "linting, indexing and parser-driven indentation are off"))
+    (when (and sv-mode-enable-flymake (not noninteractive))
+      (flymake-mode 1))))
 
 (defun sv-mode-current-defun ()
   "Return the name of the design unit or subprogram around point."

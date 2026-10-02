@@ -47,6 +47,34 @@
   :type 'integer
   :group 'sv-index)
 
+(defcustom sv-index-max-file-size (* 2 1024 1024)
+  "Size in bytes beyond which a source file is left out of deep analysis.
+A generated netlist can run to tens of megabytes, and parsing one in
+Lisp takes long enough to freeze the session.  Above this limit a file
+is not indexed, and `sv-mode' keeps the whole-buffer services -- the
+lint pass, the user-type highlighting, completion, ElDoc and
+parser-driven indentation -- out of its buffer too.  nil means no
+limit."
+  :type '(choice (integer :tag "Bytes") (const :tag "No limit" nil))
+  :group 'sv-index)
+
+(defcustom sv-index-scan-seconds 10
+  "Seconds the walk listing a project's files may spend before it stops.
+The walk only happens where git cannot list the checkout for us, and on
+a networked filesystem it can otherwise churn for minutes with the
+session frozen.  When the budget runs out, the files found so far are
+what gets indexed.  nil means walk the whole tree however long it
+takes."
+  :type '(choice (number :tag "Seconds") (const :tag "No limit" nil))
+  :group 'sv-index)
+
+(defun sv-index-buffer-large-p (&optional buffer)
+  "Return non-nil when BUFFER is too large to parse, lint or index.
+BUFFER defaults to the current buffer.  See `sv-index-max-file-size'."
+  (and sv-index-max-file-size
+       (> (buffer-size (and buffer (get-buffer buffer)))
+          sv-index-max-file-size)))
+
 (cl-defstruct (sv-symbol (:constructor sv-symbol-create) (:copier nil))
   "One named thing found in a source file.
 LINE is 1-based and COL is 0-based, so both a buffer and a file location
@@ -172,14 +200,20 @@ can be rebuilt from them."
                   symbols)))
 
 (defun sv-index-buffer (&optional buffer)
-  "Return (TREE . SYMBOLS) for BUFFER, reparsing only when it has changed."
+  "Return (TREE . SYMBOLS) for BUFFER, reparsing only when it has changed.
+A buffer larger than `sv-index-max-file-size' is never parsed and
+yields (nil . nil): completion, ElDoc and the rest ask for this on
+every pause, and each would otherwise freeze the session."
   (with-current-buffer (or buffer (current-buffer))
     (let ((tick (buffer-chars-modified-tick)))
       (unless (and sv-index--buffer-cache
                    (equal (car sv-index--buffer-cache) tick))
-        (let ((tree (sv-parse-buffer)))
-          (setq sv-index--buffer-cache
-                (list tick tree (sv-index-tree-symbols tree (buffer-file-name))))))
+        (setq sv-index--buffer-cache
+              (if (sv-index-buffer-large-p)
+                  (list tick nil nil)
+                (let ((tree (sv-parse-buffer)))
+                  (list tick tree
+                        (sv-index-tree-symbols tree (buffer-file-name)))))))
       (cons (nth 1 sv-index--buffer-cache) (nth 2 sv-index--buffer-cache)))))
 
 (defun sv-index-buffer-symbols (&optional buffer)
@@ -187,16 +221,25 @@ can be rebuilt from them."
   (cdr (sv-index-buffer buffer)))
 
 (defun sv-index-file (file)
-  "Return (TREE . SYMBOLS) for FILE, reparsing it only when it has changed."
+  "Return (TREE . SYMBOLS) for FILE, reparsing it only when it has changed.
+A file larger than `sv-index-max-file-size' is never parsed and yields
+\(nil . nil), so a generated netlist costs the index one stat instead of
+a minutes-long parse."
   (let* ((attributes (file-attributes file))
          (time (and attributes (file-attribute-modification-time attributes)))
+         (size (and attributes (file-attribute-size attributes)))
          (cached (gethash file sv-index--file-cache)))
-    (if (and cached time (equal (nth 0 cached) time))
-        (cons (nth 1 cached) (nth 2 cached))
+    (cond
+     ((and cached time (equal (nth 0 cached) time))
+      (cons (nth 1 cached) (nth 2 cached)))
+     ((and size sv-index-max-file-size (> size sv-index-max-file-size))
+      (puthash file (list time nil nil) sv-index--file-cache)
+      (cons nil nil))
+     (t
       (let* ((tree (condition-case nil (sv-parse-file file) (error nil)))
              (symbols (and tree (sv-index-tree-symbols tree file))))
         (puthash file (list time tree symbols) sv-index--file-cache)
-        (cons tree symbols)))))
+        (cons tree symbols))))))
 
 (defun sv-index-root (&optional directory)
   "Return the project root above DIRECTORY, or DIRECTORY itself.
@@ -256,14 +299,20 @@ skipped rather than aborting the walk, and hidden directories are not
 entered at all -- `.git' or a container store under `.local' would
 otherwise dominate the scan.  Symbolic links are never followed.  The
 walk is breadth-first so that when LIMIT cuts it short, the files
-nearest the root are the ones that survive."
+nearest the root are the ones that survive; `sv-index-scan-seconds'
+cuts it short the same way when a vast tree on a slow filesystem
+would stall the session."
   (let ((level (list (directory-file-name (expand-file-name root-directory))))
         (files '())
-        (count 0))
-    (while (and level (< count limit))
+        (count 0)
+        (deadline (and sv-index-scan-seconds
+                       (+ (float-time) sv-index-scan-seconds))))
+    (while (and level (< count limit)
+                (or (null deadline) (< (float-time) deadline)))
       (let ((next '()))
         (dolist (directory level)
-          (when (< count limit)
+          (when (and (< count limit)
+                     (or (null deadline) (< (float-time) deadline)))
             (dolist (entry (condition-case nil
                                (directory-files-and-attributes
                                 directory t "\\`[^.]")
@@ -396,14 +445,16 @@ a call made while a build is running just adds its callback to it."
      ((eq files 'list)
       (setf (nth 2 sv-index--build-state) (sv-index-project-files root)))
      (files
-      ;; Parse a handful of files, dropping the slice the moment the
-      ;; user types; whatever is left waits for the next tick.
-      (let ((budget 25))
-        (while (and files (> budget 0)
+      ;; Parse files for a bounded slice of time, dropping the one being
+      ;; read the moment the user types; whatever is left waits for the
+      ;; next tick.  The budget is time rather than a file count because
+      ;; a single large file would otherwise hold the session for as
+      ;; long as it takes to parse.
+      (let ((deadline (+ (float-time) 0.5)))
+        (while (and files (< (float-time) deadline)
                     (eq 'done (while-no-input (sv-index-file (car files))
                                               'done)))
-          (setq files (cdr files))
-          (setq budget (1- budget))))
+          (setq files (cdr files))))
       (setf (nth 2 sv-index--build-state) files))
      (t
       (cancel-timer sv-index--build-timer)

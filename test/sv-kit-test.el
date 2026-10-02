@@ -1531,6 +1531,96 @@ OCCURRENCE selects which match to look at, counting from one."
                (string-match "always_comb" (buffer-string))))))
 
 
+;;;; Large files
+
+(ert-deftest sv-index-skips-a-buffer-over-the-size-limit ()
+  (with-temp-buffer
+    (insert "module m; typedef logic my_t; my_t x; endmodule\n")
+    (let ((sv-index-max-file-size 10))
+      (should (sv-index-buffer-large-p))
+      (should (null (car (sv-index-buffer))))
+      (should (null (sv-index-buffer-symbols))))
+    ;; Raising the limit and touching the buffer parses it after all.
+    (let ((sv-index-max-file-size nil))
+      (insert "\n")
+      (should (car (sv-index-buffer))))))
+
+(ert-deftest sv-index-skips-a-file-over-the-size-limit ()
+  (let ((file (make-temp-file "sv-index-large" nil ".sv"
+                              "module big; endmodule\n")))
+    (unwind-protect
+        (progn
+          (let ((sv-index-max-file-size 5))
+            (sv-index-invalidate file)
+            (should (null (car (sv-index-file file)))))
+          ;; The verdict is cached; only a fresh look may parse the file.
+          (sv-index-invalidate file)
+          (should (equal (plist-get (car (plist-get (car (sv-index-file file))
+                                                    :units))
+                         :name)
+                         "big")))
+      (sv-index-invalidate file)
+      (delete-file file))))
+
+(ert-deftest sv-mode-keeps-deep-analysis-out-of-a-large-buffer ()
+  (with-temp-buffer
+    (insert "module m; typedef logic my_t; my_t x; endmodule\n")
+    (let ((sv-index-max-file-size 10))
+      (sv-mode)
+      (should-not (eq indent-line-function #'sv-format-indent-line))
+      (should (null sv-mode--user-type-keywords))))
+  ;; A buffer under the limit gets everything.
+  (with-temp-buffer
+    (insert "module m; typedef logic my_t; my_t x; endmodule\n")
+    (sv-mode)
+    (should (eq indent-line-function #'sv-format-indent-line))
+    (should sv-mode--user-type-keywords)))
+
+(ert-deftest sv-kit-flymake-reports-nothing-for-a-large-buffer ()
+  (with-temp-buffer
+    (insert "module m;\n  initial x = 1;\t\nendmodule\n")
+    (let ((sv-index-max-file-size 10)
+          (reported 'untouched))
+      (sv-kit-flymake-backend (lambda (diagnostics &rest _)
+                                (setq reported diagnostics)))
+      (should (null reported)))))
+
+(ert-deftest sv-kit-diagnostic-regions-match-a-per-finding-lookup ()
+  ;; The one-pass walk must mark exactly the regions the old
+  ;; line-by-line lookup from the top of the buffer found.
+  (with-temp-buffer
+    (insert "module m;\n  initial x = 1;\t\n  always @(posedge c)\n"
+            "    if (x)\ty <= 1;\nendmodule\n")
+    (let ((diagnostics (sv-lint-buffer)))
+      (should (> (length diagnostics) 1))
+      (should
+       (equal (sv-kit--diagnostic-regions diagnostics)
+              (mapcar
+               (lambda (diagnostic)
+                 (save-excursion
+                   (goto-char (point-min))
+                   (forward-line (1- (sv-diagnostic-line diagnostic)))
+                   (let* ((start (min (point-max)
+                                      (+ (point)
+                                         (sv-diagnostic-col diagnostic))))
+                          (end (save-excursion
+                                 (goto-char start)
+                                 (if (re-search-forward
+                                      "[A-Za-z0-9_$]+\\|.\\|\n"
+                                      (line-end-position) t)
+                                     (match-end 0)
+                                   (min (point-max) (1+ start))))))
+                     (cons start (max end (1+ start))))))
+               diagnostics))))))
+
+(ert-deftest sv-index-scan-stops-when-its-time-is-up ()
+  (sv-test-with-project
+    (let ((regexp "\\.sv\\'"))
+      (should (sv-index--scan-tree sv-test-fixtures regexp 100))
+      (let ((sv-index-scan-seconds 0))
+        (should (null (sv-index--scan-tree sv-test-fixtures regexp 100)))))))
+
+
 ;;;; Rules added on top of the first set
 
 (ert-deftest sv-lint-finds-a-signal-with-several-drivers ()

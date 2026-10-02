@@ -106,6 +106,11 @@ brackets, while its closing brace stayed visible.")
 (defconst sv-lexer--punct-chars "()[]{};,"
   "Characters lexed as punctuation.")
 
+(defconst sv-lexer--punct-list (append sv-lexer--punct-chars nil)
+  "The characters of `sv-lexer--punct-chars', as a list for `memq'.
+Built once: consing it afresh for each of the millions of tokens of a
+generated netlist is measurable.")
+
 (defun sv-lexer-keyword-p (name)
   "Return non-nil when NAME is a SystemVerilog reserved word."
   (and (stringp name) (gethash name sv-lexer--keyword-table)))
@@ -186,7 +191,7 @@ Return a list of `sv-token' structures in source order, trivia included."
             (setq type (if (sv-lexer-keyword-p (match-string-no-properties 0))
                            'keyword
                          'ident)))
-           ((memq (char-after) (string-to-list sv-lexer--punct-chars))
+           ((memq (char-after) sv-lexer--punct-list)
             (forward-char 1)
             (setq type 'punct))
            ((looking-at sv-lexer--operator-regexp)

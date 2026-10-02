@@ -140,6 +140,26 @@ outer_t.head: inner_t head
 logic [7:0] w_data  [var in probe]
 ```
 
+## 巨大な生成ファイル
+
+数十 MB のネットリストやハーネスを Lisp でパースすると、それだけで分単位の
+フリーズになります。そこで `sv-index-max-file-size`（既定 2 MB）を超える
+ファイルは**深い解析の対象から外れます**。キーワードのハイライトはそのまま
+効き、ファイルは一瞬で開きますが、そのバッファでは lint・ユーザ型ハイライト・
+補完・ElDoc・パーサ駆動のインデントが止まり、プロジェクト索引もそのファイル
+だけ読み飛ばします（開いたときにエコーエリアへその旨を表示します）。
+
+プロジェクトのファイル一覧は git があれば `git ls-files` で一瞬ですが、
+git が使えないツリーを歩くときは `sv-index-scan-seconds`（既定 10 秒）で
+打ち切り、それまでに見つかったファイルだけを索引にします。NFS 上の巨大な
+リポジトリでもセッションが止まりません。
+
+```elisp
+(setq sv-index-max-file-size (* 8 1024 1024)) ; 8 MB まで解析する
+(setq sv-index-max-file-size nil)             ; 無制限（覚悟のうえで）
+(setq sv-index-scan-seconds 30)               ; 遅いファイルサーバ向け
+```
+
 ## 便利なコマンド
 
 - `C-c C-a` (`sv-kit-align-instance-ports`) … カーソル位置のインスタンスの接続を、
